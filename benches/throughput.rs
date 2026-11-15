@@ -63,6 +63,14 @@ fn nested(depth: usize, leaf: i64) -> Value {
 
 fn main() {
     let value = Value::Array((0..1000).map(record).collect());
+    // `cargo bench -- --profile-encode`: nothing but encoding, for a profiler to sample.
+    if std::env::args().any(|arg| arg == "--profile-encode") {
+        let start = Instant::now();
+        while start.elapsed().as_secs() < 8 {
+            black_box(encode(black_box(&value)).unwrap());
+        }
+        return;
+    }
     let bytes = encode(&value).unwrap();
     let json = fleece::json::to_json(&value);
     let text = json.to_string();
@@ -70,6 +78,11 @@ fn main() {
 
     let path: KeyPath = "[500].address.city".parse().unwrap();
     measure("fleece: encode a value", bytes.len(), || encode(&value).unwrap());
+    let one = record(500);
+    let one_len = encode(&one).unwrap().len();
+    measure("fleece: encode one record", one_len, || encode(&one).unwrap());
+    let one_json = fleece::json::to_json(&one);
+    measure("serde_json: write one record", one_json.to_string().len(), || one_json.to_string());
     measure("fleece: check a document", bytes.len(), || Doc::new(&bytes).unwrap());
     measure("fleece: check and decode to a value", bytes.len(), || decode(&bytes).unwrap());
     measure("fleece: read one field in place, unchecked", bytes.len(), || {

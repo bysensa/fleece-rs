@@ -162,7 +162,8 @@ pub(crate) fn varint_len(n: u64) -> usize {
     (64 - (n | 1).leading_zeros() as usize).div_ceil(7)
 }
 
-fn pad(out: &mut Vec<u8>) {
+/// Brings the length of `out` to an even number.
+pub(crate) fn pad(out: &mut Vec<u8>) {
     if out.len() & 1 == 1 {
         out.push(0);
     }
@@ -211,14 +212,20 @@ pub(crate) fn put_f64(out: &mut Vec<u8>, v: f64) {
 
 /// A string (`TAG_STRING`) or binary data (`TAG_DATA`).
 pub(crate) fn put_bytes(out: &mut Vec<u8>, tag: u8, bytes: &[u8]) {
-    if bytes.len() < 15 {
-        out.push(tag << 4 | bytes.len() as u8);
-    } else {
-        out.push(tag << 4 | 15);
-        put_varint(out, bytes.len() as u64);
-    }
+    out.reserve(bytes.len() + 4);
+    put_bytes_header(out, tag, bytes.len());
     out.extend_from_slice(bytes);
     pad(out);
+}
+
+/// What comes before the `len` bytes of a string or of binary data.
+pub(crate) fn put_bytes_header(out: &mut Vec<u8>, tag: u8, len: usize) {
+    if len < 15 {
+        out.push(tag << 4 | len as u8);
+    } else {
+        out.push(tag << 4 | 15);
+        put_varint(out, len as u64);
+    }
 }
 
 /// The offset of a string's or data's bytes from the start of its value.

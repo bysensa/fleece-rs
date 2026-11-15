@@ -40,11 +40,6 @@ fn seconds_bytes(secs: [u8; 8], nanos: u32) -> [u8; 12] {
     bytes
 }
 
-/// The points as pairs of little-endian doubles.
-fn points_bytes(points: &[Point]) -> Vec<u8> {
-    points.iter().flat_map(|p| [p.x.to_le_bytes(), p.y.to_le_bytes()]).flatten().collect()
-}
-
 fn bound_flag<T>(bound: &Bound<T>) -> i64 {
     match bound {
         Bound::Unbounded => BOUND_UNBOUNDED,
@@ -215,8 +210,14 @@ impl Encoder<'_> {
         }
     }
 
+    /// The points as pairs of little-endian doubles.
     fn write_points(&mut self, points: &[Point]) -> Result<(), EncodeError> {
-        self.write_data(&points_bytes(points))
+        self.write_data_from(points.len() * 16, |out| {
+            for point in points {
+                out.extend_from_slice(&point.x.to_le_bytes());
+                out.extend_from_slice(&point.y.to_le_bytes());
+            }
+        })
     }
 
     fn write_rings(&mut self, rings: &[Vec<Point>]) -> Result<(), EncodeError> {

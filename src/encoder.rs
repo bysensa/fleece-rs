@@ -2,6 +2,8 @@
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher, Hasher};
 
 use crate::error::EncodeError;
 use crate::format::*;
@@ -57,6 +59,66 @@ impl Shared<'_> {
     }
 }
 
+/// The hashing of the table of short strings. A string of up to 15 bytes and its length
+/// are one 128-bit number, which is hashed by one multiplication with two numbers picked
+/// at random for each encoder, so that strings chosen by someone else cannot be made to
+/// fall into one bucket.
+#[derive(Clone, Copy)]
+struct Seeds(u64, u64);
+
+impl Seeds {
+    fn random() -> Self {
+        let state = RandomState::new();
+        Self(state.hash_one(0u8), state.hash_one(1u8))
+    }
+
+    fn fold(self, low: u64, high: u64) -> u64 {
+        let product = u128::from(low ^ self.0) * u128::from(high ^ self.1);
+        product as u64 ^ (product >> 64) as u64
+    }
+}
+
+impl BuildHasher for Seeds {
+    type Hasher = Fold;
+
+    fn build_hasher(&self) -> Fold {
+        Fold { seeds: *self, hash: 0 }
+    }
+}
+
+struct Fold {
+    seeds: Seeds,
+    hash: u64,
+}
+
+impl Hasher for Fold {
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut word = [0; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            self.hash = self.seeds.fold(u64::from_le_bytes(word), self.hash);
+        }
+    }
+
+    fn write_u128(&mut self, key: u128) {
+        self.hash = self.seeds.fold(key as u64, (key >> 64) as u64 ^ self.hash);
+    }
+
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+}
+
+/// A string of 2 to 15 bytes as one number: its bytes, then its length.
+fn string_key(bytes: &[u8]) -> u128 {
+    let mut key = [0; 16];
+    key[..bytes.len()].copy_from_slice(bytes);
+    key[15] = bytes.len() as u8;
+    u128::from_le_bytes(key)
+}
+
+/// A collection that is open. Its slots and keys are the last ones of the encoder's, from
+/// these indexes on.
 struct Frame {
     dict: bool,
     /// The dictionary of the base document this one inherits from: only the entries that
@@ -64,8 +126,8 @@ struct Frame {
     parent: Option<usize>,
     /// The kind of the extended value this collection is the payload of.
     ext: Option<u8>,
-    slots: Vec<Slot>,
-    keys: Vec<SortKey>,
+    first_slot: usize,
+    first_key: usize,
     /// Whether a dictionary takes a key next.
     expects_key: bool,
 }
@@ -93,12 +155,19 @@ pub struct Encoder<'k> {
     /// Whether pointers into the base are marked as leaving the document.
     external: bool,
     stack: Vec<Frame>,
-    /// The positions of the short strings written so far.
-    strings: HashMap<Box<[u8]>, usize>,
+    /// The slots of every open collection, those of the innermost one last.
+    slots: Vec<Slot>,
+    /// The keys of every open dictionary, in the same order.
+    keys: Vec<SortKey>,
+    /// The order of the entries of the dictionary being ended, kept between dictionaries.
+    order: Vec<usize>,
+    /// The slots of the dictionary being ended in that order, kept as well.
+    ordered: Vec<Slot>,
+    /// The positions of the short strings written so far, by [`string_key`].
+    strings: HashMap<u128, usize, Seeds>,
     shared: Shared<'k>,
     root: Option<Slot>,
     pending_ext: Option<u8>,
-    scratch: Vec<u8>,
 }
 
 impl Default for Encoder<'_> {
@@ -114,11 +183,14 @@ impl<'k> Encoder<'k> {
             base_len: 0,
             external: false,
             stack: Vec::new(),
-            strings: HashMap::new(),
+            slots: Vec::new(),
+            keys: Vec::new(),
+            order: Vec::new(),
+            ordered: Vec::new(),
+            strings: HashMap::with_hasher(Seeds::random()),
             shared: Shared::None,
             root: None,
             pending_ext: None,
-            scratch: Vec::new(),
         }
     }
 
@@ -155,16 +227,6 @@ impl<'k> Encoder<'k> {
         self.base_len + self.out.len()
     }
 
-    /// Writes the bytes of a whole value and gives the slot that stands for it.
-    fn place(&mut self, bytes: &[u8]) -> Slot {
-        if let &[a, b] = bytes {
-            return Slot::Inline([a, b]);
-        }
-        let position = self.position();
-        self.out.extend_from_slice(bytes);
-        Slot::Pointer(position)
-    }
-
     /// Refuses a value where one is not taken.
     fn check_value(&self) -> Result<(), EncodeError> {
         match self.stack.last() {
@@ -177,7 +239,7 @@ impl<'k> Encoder<'k> {
     fn push(&mut self, slot: Slot) {
         match self.stack.last_mut() {
             Some(frame) => {
-                frame.slots.push(slot);
+                self.slots.push(slot);
                 frame.expects_key = frame.dict;
             }
             None => self.root = Some(slot),
@@ -185,17 +247,22 @@ impl<'k> Encoder<'k> {
     }
 
     /// Writes a value that is not a collection, after the header of the extended value it is
-    /// the payload of, when there is one.
+    /// the payload of, when there is one. `put` appends the bytes of the whole value.
     fn scalar(&mut self, put: impl FnOnce(&mut Vec<u8>)) -> Result<(), EncodeError> {
         self.check_value()?;
-        let mut bytes = std::mem::take(&mut self.scratch);
-        bytes.clear();
+        let start = self.out.len();
         if let Some(kind) = self.pending_ext.take() {
-            bytes.extend_from_slice(&[SPECIAL_EXT, kind]);
+            self.out.extend_from_slice(&[SPECIAL_EXT, kind]);
         }
-        put(&mut bytes);
-        let slot = self.place(&bytes);
-        self.scratch = bytes;
+        put(&mut self.out);
+        // A value of 2 bytes lives in the slot that holds it, not in the output.
+        let slot = match self.out[start..] {
+            [a, b] => {
+                self.out.truncate(start);
+                Slot::Inline([a, b])
+            }
+            _ => Slot::Pointer(self.base_len + start),
+        };
         self.push(slot);
         Ok(())
     }
@@ -230,6 +297,19 @@ impl<'k> Encoder<'k> {
         self.scalar(|out| put_bytes(out, TAG_DATA, value))
     }
 
+    /// Binary data of `len` bytes that `fill` appends, written without a copy of them.
+    pub(crate) fn write_data_from(
+        &mut self,
+        len: usize,
+        fill: impl FnOnce(&mut Vec<u8>),
+    ) -> Result<(), EncodeError> {
+        self.scalar(|out| {
+            put_bytes_header(out, TAG_DATA, len);
+            fill(out);
+            pad(out);
+        })
+    }
+
     pub fn write_str(&mut self, value: &str) -> Result<(), EncodeError> {
         if self.pending_ext.is_some() {
             return self.scalar(|out| put_bytes(out, TAG_STRING, value.as_bytes()));
@@ -246,6 +326,11 @@ impl<'k> Encoder<'k> {
             return Err(EncodeError::ExtPayload);
         }
         self.scalar(|out| out.extend_from_slice(&[SPECIAL_EXT, ext::NONE]))
+    }
+
+    /// Fleece's `undefined`: the value of a key deleted from a dictionary that inherits.
+    pub(crate) fn write_undefined(&mut self) -> Result<(), EncodeError> {
+        self.scalar(|out| out.extend_from_slice(&[SPECIAL_UNDEFINED, 0]))
     }
 
     /// Makes the next value written, whether a scalar or a whole collection, the payload of
@@ -269,18 +354,16 @@ impl<'k> Encoder<'k> {
             let slot = Slot::Inline([TAG_STRING << 4 | bytes.len() as u8, byte]);
             return (slot, SortKey::Tiny([byte], bytes.len()));
         }
-        let shared = SHARED_STRING_LEN.contains(&bytes.len());
-        let position = match self.strings.get(bytes) {
-            Some(&position) if shared => position,
-            _ => {
-                let position = self.position();
-                put_bytes(&mut self.out, TAG_STRING, bytes);
-                if shared {
-                    self.strings.insert(bytes.into(), position);
-                }
-                position
-            }
+        // A short string seen before is at the position the table has for it.
+        let next = self.position();
+        let position = if SHARED_STRING_LEN.contains(&bytes.len()) {
+            *self.strings.entry(string_key(bytes)).or_insert(next)
+        } else {
+            next
         };
+        if position == next {
+            put_bytes(&mut self.out, TAG_STRING, bytes);
+        }
         let start = position - self.base_len + bytes_offset(bytes.len());
         (Slot::Pointer(position), SortKey::Written(start, bytes.len()))
     }
@@ -311,9 +394,9 @@ impl<'k> Encoder<'k> {
                 None => self.string(key.as_bytes()),
             },
         };
+        self.slots.push(slot);
+        self.keys.push(sort_key);
         if let Some(frame) = self.stack.last_mut() {
-            frame.slots.push(slot);
-            frame.keys.push(sort_key);
             frame.expects_key = false;
         }
         Ok(())
@@ -324,12 +407,21 @@ impl<'k> Encoder<'k> {
         if self.stack.len() >= MAX_DEPTH {
             return Err(EncodeError::TooDeep);
         }
+        if self.slots.capacity() == 0 {
+            // The first collection: room for a small document at once, where growing from
+            // nothing would take each of these through several sizes.
+            self.out.reserve(256);
+            self.stack.reserve(8);
+            self.slots.reserve(32);
+            self.keys.reserve(16);
+            self.strings.reserve(16);
+        }
         self.stack.push(Frame {
             dict,
             parent,
             ext: self.pending_ext.take(),
-            slots: Vec::new(),
-            keys: Vec::new(),
+            first_slot: self.slots.len(),
+            first_key: self.keys.len(),
             expects_key: dict,
         });
         Ok(())
@@ -353,11 +445,6 @@ impl<'k> Encoder<'k> {
         self.begin(true, Some(parent))
     }
 
-    /// Fleece's `undefined`: the value of a key deleted from a dictionary that inherits.
-    pub(crate) fn write_undefined(&mut self) -> Result<(), EncodeError> {
-        self.scalar(|out| out.extend_from_slice(&[SPECIAL_UNDEFINED, 0]))
-    }
-
     pub fn end_array(&mut self) -> Result<(), EncodeError> {
         self.end(false)
     }
@@ -374,8 +461,16 @@ impl<'k> Encoder<'k> {
         let Some(frame) = self.stack.pop_if(|_| matches) else {
             return Err(EncodeError::Unbalanced);
         };
-        let slot = self.collection(frame)?;
-        self.push(slot);
+        // The slots and keys of the collection are lent out of the encoder while it is
+        // written, and given back with the collection taken off their end.
+        let slots = std::mem::take(&mut self.slots);
+        let keys = std::mem::take(&mut self.keys);
+        let slot = self.collection(&frame, &slots[frame.first_slot..], &keys[frame.first_key..]);
+        self.slots = slots;
+        self.slots.truncate(frame.first_slot);
+        self.keys = keys;
+        self.keys.truncate(frame.first_key);
+        self.push(slot?);
         Ok(())
     }
 
@@ -398,77 +493,119 @@ impl<'k> Encoder<'k> {
         }
     }
 
-    fn collection(&mut self, frame: Frame) -> Result<Slot, EncodeError> {
-        let Frame { dict, parent, ext, mut slots, keys, .. } = frame;
-        let mut count = if dict { keys.len() } else { slots.len() };
-        if dict {
-            let mut order: Vec<usize> = (0..count).collect();
-            order.sort_by(|&a, &b| self.compare_keys(&keys[a], &keys[b]));
-            for pair in order.windows(2) {
-                if self.compare_keys(&keys[pair[0]], &keys[pair[1]]) == Ordering::Equal {
-                    let key = match keys[pair[0]] {
-                        SortKey::Shared(number) => {
-                            self.shared.key(number).unwrap_or_default().to_owned()
-                        }
-                        ref key => String::from_utf8_lossy(self.key_bytes(key)).into_owned(),
-                    };
-                    return Err(EncodeError::DuplicateKey(key));
-                }
-            }
-            // The entry of the parent has the lowest key there is, so it comes first.
-            let parent = parent.map(|parent| [Slot::Inline([0x08, 0x00]), Slot::Pointer(parent)]);
-            let entries = order.iter().map(|&i| [slots[2 * i], slots[2 * i + 1]]);
-            slots = parent.into_iter().chain(entries).flatten().collect();
-            count = slots.len() / 2;
+    /// Fills `self.ordered` with the slots of a dictionary as it stores them: the entry of
+    /// the parent, then the entries by key. Refuses a key that is there twice.
+    fn order_entries(
+        &mut self,
+        parent: Option<usize>,
+        slots: &[Slot],
+        keys: &[SortKey],
+    ) -> Result<(), EncodeError> {
+        let mut order = std::mem::take(&mut self.order);
+        order.clear();
+        order.extend(0..keys.len());
+        order.sort_unstable_by(|&a, &b| self.compare_keys(&keys[a], &keys[b]));
+        let twice = order
+            .windows(2)
+            .find(|pair| self.compare_keys(&keys[pair[0]], &keys[pair[1]]) == Ordering::Equal);
+        let result = match twice {
+            Some(pair) => Err(EncodeError::DuplicateKey(match keys[pair[0]] {
+                SortKey::Shared(number) => self.shared.key(number).unwrap_or_default().to_owned(),
+                ref key => String::from_utf8_lossy(self.key_bytes(key)).into_owned(),
+            })),
+            None => Ok(()),
+        };
+        self.ordered.clear();
+        // The entry of the parent has the lowest key there is, so it comes first.
+        let parent = parent.map(|parent| [Slot::Inline([0x08, 0x00]), Slot::Pointer(parent)]);
+        let entries = order.iter().map(|&i| [slots[2 * i], slots[2 * i + 1]]);
+        self.ordered.extend(parent.into_iter().chain(entries).flatten());
+        self.order = order;
+        result
+    }
+
+    /// Writes a collection whose items are written, and gives the slot that stands for it.
+    fn collection(
+        &mut self,
+        frame: &Frame,
+        slots: &[Slot],
+        keys: &[SortKey],
+    ) -> Result<Slot, EncodeError> {
+        // Keys that came in order and once each, as those of a sorted map do, stay as they
+        // are; anything else is put in order first.
+        let in_order = keys.windows(2).all(|pair| self.compare_keys(&pair[0], &pair[1]).is_lt());
+        if !frame.dict || (in_order && frame.parent.is_none()) {
+            return self.write_collection(frame, slots);
         }
-        let tag = if dict { TAG_DICT } else { TAG_ARRAY };
-        if count == 0 && ext.is_none() {
+        self.order_entries(frame.parent, slots, keys)?;
+        let ordered = std::mem::take(&mut self.ordered);
+        let slot = self.write_collection(frame, &ordered);
+        self.ordered = ordered;
+        slot
+    }
+
+    fn write_collection(&mut self, frame: &Frame, slots: &[Slot]) -> Result<Slot, EncodeError> {
+        let count = if frame.dict { slots.len() / 2 } else { slots.len() };
+        let tag = if frame.dict { TAG_DICT } else { TAG_ARRAY };
+        if count == 0 && frame.ext.is_none() {
             return Ok(Slot::Inline([tag << 4, 0]));
         }
-
+        let start = self.out.len();
         let position = self.position();
-        let mut header = Vec::with_capacity(8);
-        if let Some(kind) = ext {
-            header.extend_from_slice(&[SPECIAL_EXT, kind]);
-        }
-        let short = count.min(LONG_COUNT);
-        let tag_at = header.len();
-        header.extend_from_slice(&[tag << 4 | (short >> 8) as u8, short as u8]);
-        if count >= LONG_COUNT {
-            put_varint(&mut header, (count - LONG_COUNT) as u64);
-            if header.len() & 1 == 1 {
-                header.push(0);
+        // The collection is narrow when every pointer of it reaches its value in 2 bytes,
+        // which nearly all do: it is written so, and written again wide when one does not.
+        self.out.reserve(16 + slots.len() * 2);
+        self.collection_header(frame.ext, tag, false, count);
+        let first = self.position();
+        let narrow = slots.iter().enumerate().all(|(i, slot)| match *slot {
+            Slot::Inline(bytes) => {
+                self.out.extend_from_slice(&bytes);
+                true
             }
-        }
-        // The collection is narrow when every pointer of it reaches its value in 2 bytes.
-        let first = position + header.len();
-        let farthest = |width: usize| {
-            let offsets = slots.iter().enumerate().filter_map(|(i, slot)| match slot {
-                Slot::Pointer(target) => Some(first + i * width - target),
-                Slot::Inline(_) => None,
-            });
-            offsets.max().unwrap_or(0)
-        };
-        let wide = farthest(2) > MAX_NARROW_OFFSET;
-        if wide {
-            if farthest(4) > MAX_WIDE_OFFSET {
-                return Err(EncodeError::TooLarge);
+            Slot::Pointer(target) => {
+                let offset = first + 2 * i - target;
+                let external = self.external && target < self.base_len;
+                let flags = 0x8000 | if external { 0x4000 } else { 0 };
+                self.out.extend_from_slice(&((offset / 2) as u16 | flags).to_be_bytes());
+                offset <= MAX_NARROW_OFFSET
             }
-            header[tag_at] |= 0x08;
+        });
+        if narrow {
+            return Ok(Slot::Pointer(position));
         }
-        self.out.extend_from_slice(&header);
+
+        self.out.truncate(start);
+        let pointers = slots.iter().enumerate().filter_map(|(i, slot)| match slot {
+            Slot::Pointer(target) => Some(first + 4 * i - target),
+            Slot::Inline(_) => None,
+        });
+        if pointers.max().unwrap_or(0) > MAX_WIDE_OFFSET {
+            return Err(EncodeError::TooLarge);
+        }
+        self.out.reserve(16 + slots.len() * 4);
+        self.collection_header(frame.ext, tag, true, count);
         for slot in slots {
-            match slot {
-                Slot::Inline(bytes) => {
-                    self.out.extend_from_slice(&bytes);
-                    if wide {
-                        self.out.extend_from_slice(&[0, 0]);
-                    }
-                }
-                Slot::Pointer(target) => self.pointer(target, wide),
+            match *slot {
+                Slot::Inline(bytes) => self.out.extend_from_slice(&[bytes[0], bytes[1], 0, 0]),
+                Slot::Pointer(target) => self.pointer(target, true),
             }
         }
         Ok(Slot::Pointer(position))
+    }
+
+    /// Writes what comes before the slots of a collection.
+    fn collection_header(&mut self, ext: Option<u8>, tag: u8, wide: bool, count: usize) {
+        if let Some(kind) = ext {
+            self.out.extend_from_slice(&[SPECIAL_EXT, kind]);
+        }
+        // A count of 2047 or more is 2047 in the header and the rest in a varint after it.
+        let short = count.min(LONG_COUNT);
+        let flags = tag << 4 | if wide { 0x08 } else { 0 };
+        self.out.extend_from_slice(&[flags | (short >> 8) as u8, short as u8]);
+        if let Some(rest) = count.checked_sub(LONG_COUNT) {
+            put_varint(&mut self.out, rest as u64);
+            pad(&mut self.out);
+        }
     }
 
     /// Writes a pointer from the current position back to `target`.
