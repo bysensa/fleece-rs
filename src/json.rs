@@ -14,6 +14,7 @@ use serde_json::{Map, Value as Json, json};
 use crate::codec::{decode, encode};
 use crate::error::{DecodeError, EncodeError};
 use crate::value::*;
+use crate::vector::Vector;
 
 /// Why JSON could not be turned into a value, or a document into JSON.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -84,6 +85,60 @@ fn float_from(json: &Json) -> Option<f64> {
 
 /// The value as JSON.
 pub fn to_json(value: &Value) -> Json {
+    // The values that hold other values are each written by a small function of their
+    // own, and all the others by one large one: what is called once for every level of a
+    // deep value stays small on the stack.
+    match value {
+        Value::Array(items) => items_json(items),
+        Value::Set(items) => typed("set", items_json(items)),
+        Value::Object(fields) => fields_json(fields),
+        Value::Range(range) => typed("range", range_json(range)),
+        Value::RecordId(record) => typed("record", record_json(record)),
+        leaf => leaf_json(leaf),
+    }
+}
+
+fn items_json(items: &[Value]) -> Json {
+    let mut array = Vec::with_capacity(items.len());
+    for item in items {
+        array.push(to_json(item));
+    }
+    Json::Array(array)
+}
+
+fn fields_json(fields: &Object) -> Json {
+    let mut object = Map::new();
+    for (key, value) in fields {
+        let key = if key.starts_with('$') { format!("${key}") } else { key.clone() };
+        object.insert(key, to_json(value));
+    }
+    Json::Object(object)
+}
+
+fn range_json(range: &Range) -> Json {
+    let mut bounds = Map::new();
+    for (name, bound) in [("start", &range.start), ("end", &range.end)] {
+        let (how, value) = match bound {
+            Bound::Included(value) => ("included", value),
+            Bound::Excluded(value) => ("excluded", value),
+            Bound::Unbounded => continue,
+        };
+        let bound = Map::from_iter([(how.to_owned(), to_json(value))]);
+        bounds.insert(name.to_owned(), Json::Object(bound));
+    }
+    Json::Object(bounds)
+}
+
+fn record_json(record: &RecordId) -> Json {
+    let key = to_json(&Value::from(record.key.clone()));
+    Json::Object(Map::from_iter([
+        ("table".to_owned(), Json::String(record.table.clone())),
+        ("key".to_owned(), key),
+    ]))
+}
+
+/// A value that holds no other value.
+fn leaf_json(value: &Value) -> Json {
     match value {
         Value::None => typed("none", Json::Null),
         Value::Null => Json::Null,
@@ -117,31 +172,60 @@ pub fn to_json(value: &Value) -> Json {
         Value::Uuid(v) => typed("uuid", json!(v.to_string())),
         Value::Table(v) => typed("table", json!(v)),
         Value::Regex(v) => typed("regex", json!(v)),
-        Value::RecordId(v) => {
-            let key = to_json(&Value::from(v.key.clone()));
-            typed("record", json!({ "table": v.table, "key": key }))
-        }
         Value::File(v) => typed("file", json!({ "bucket": v.bucket, "key": v.key })),
-        Value::Range(v) => {
-            let bound = |name: &str, bound: &Bound<Value>| match bound {
-                Bound::Included(v) => Some((name.to_owned(), json!({ "included": to_json(v) }))),
-                Bound::Excluded(v) => Some((name.to_owned(), json!({ "excluded": to_json(v) }))),
-                Bound::Unbounded => None,
-            };
-            let bounds = [bound("start", &v.start), bound("end", &v.end)];
-            typed("range", Json::Object(bounds.into_iter().flatten().collect()))
-        }
-        Value::Array(items) => Json::Array(items.iter().map(to_json).collect()),
-        Value::Set(items) => typed("set", Json::Array(items.iter().map(to_json).collect())),
-        Value::Object(fields) => {
-            let field = |(key, value): (&String, &Value)| {
-                let key = if key.starts_with('$') { format!("${key}") } else { key.clone() };
-                (key, to_json(value))
-            };
-            Json::Object(fields.iter().map(field).collect())
-        }
         Value::Geometry(v) => typed("geometry", geometry_json(v)),
+        // Not reached: `to_json` takes these itself.
+        Value::Array(_)
+        | Value::Set(_)
+        | Value::Object(_)
+        | Value::Range(_)
+        | Value::RecordId(_) => to_json(value),
+        Value::Vector(v) => typed("vector", vector_json(v)),
     }
+}
+
+/// A vector as an object of one field, the type of its elements, holding the elements: an
+/// array of numbers, or for bits a string of `0` and `1`.
+fn vector_json(vector: &Vector) -> Json {
+    let floats =
+        |values: &mut dyn Iterator<Item = f64>| Json::Array(values.map(float_json).collect());
+    let elements = match vector {
+        Vector::F32(values) => floats(&mut values.iter().map(|v| f64::from(*v))),
+        Vector::F64(values) => floats(&mut values.iter().copied()),
+        Vector::F16(values) => floats(&mut values.iter().map(|v| v.to_f64())),
+        Vector::I8(values) => json!(values),
+        Vector::Bits { bytes, len } => {
+            let bit = |i: usize| bytes.get(i / 8).is_some_and(|byte| byte >> (i % 8) & 1 == 1);
+            json!((0..*len).map(|i| if bit(i) { '1' } else { '0' }).collect::<String>())
+        }
+    };
+    Json::Object(Map::from_iter([(vector.element().name().to_owned(), elements)]))
+}
+
+fn vector_from(json: &Json) -> Option<Vector> {
+    let (name, elements) = json.as_object().filter(|fields| fields.len() == 1)?.iter().next()?;
+    let floats = || elements.as_array()?.iter().map(float_from).collect::<Option<Vec<f64>>>();
+    Some(match name.as_str() {
+        "f32" => {
+            let exact = |v: f64| (v.is_nan() || f64::from(v as f32) == v).then_some(v as f32);
+            Vector::F32(floats()?.into_iter().map(exact).collect::<Option<_>>()?)
+        }
+        "f64" => Vector::F64(floats()?),
+        "f16" => Vector::F16(floats()?.into_iter().map(F16::from_f64).collect::<Option<_>>()?),
+        "i8" => {
+            let element = |v: &Json| i8::try_from(v.as_i64()?).ok();
+            Vector::I8(elements.as_array()?.iter().map(element).collect::<Option<_>>()?)
+        }
+        "bits" => {
+            let bits =
+                elements.as_str().filter(|bits| bits.bytes().all(|b| b == b'0' || b == b'1'))?;
+            let byte = |chunk: &[u8]| {
+                chunk.iter().enumerate().fold(0, |byte, (i, bit)| byte | (bit - b'0') << i)
+            };
+            Vector::Bits { bytes: bits.as_bytes().chunks(8).map(byte).collect(), len: bits.len() }
+        }
+        _ => return None,
+    })
 }
 
 /// The value JSON stands for.
@@ -155,22 +239,70 @@ pub fn from_json(json: &Json) -> Result<Value, JsonError> {
             (None, None) => Number::Float(number.as_f64().unwrap_or(f64::NAN)),
         }),
         Json::String(v) => Value::String(v.clone()),
-        Json::Array(items) => Value::Array(items.iter().map(from_json).collect::<Result<_, _>>()?),
-        Json::Object(fields) => {
-            if fields.len() == 1
-                && let Some((key, payload)) = fields.iter().next()
-                && let Some(name) = key.strip_prefix('$')
-                && !name.starts_with('$')
-            {
-                return typed_from(name, payload);
-            }
-            let field = |(key, value): (&String, &Json)| {
-                let key = if key.starts_with("$$") { &key[1..] } else { key.as_str() };
-                from_json(value).map(|value| (key.to_owned(), value))
-            };
-            Value::Object(fields.iter().map(field).collect::<Result<_, _>>()?)
-        }
+        Json::Array(items) => Value::Array(items_from(items)?),
+        Json::Object(fields) => return object_from(fields),
     })
+}
+
+fn items_from(items: &[Json]) -> Result<Vec<Value>, JsonError> {
+    let mut values = Vec::with_capacity(items.len());
+    for item in items {
+        values.push(from_json(item)?);
+    }
+    Ok(values)
+}
+
+/// An object, or the typed value an object of one field `$name` stands for. As in
+/// [`to_json`], the types that hold other values are read apart from the rest.
+fn object_from(fields: &Map<String, Json>) -> Result<Value, JsonError> {
+    if fields.len() == 1
+        && let Some((key, payload)) = fields.iter().next()
+        && let Some(name) = key.strip_prefix('$')
+        && !name.starts_with('$')
+    {
+        let bad = || JsonError::BadValue(name.to_owned());
+        return match name {
+            "set" => Ok(Value::Set(items_from(payload.as_array().ok_or_else(bad)?)?)),
+            "range" => range_from(payload).and_then(|range| range.ok_or_else(bad)),
+            "record" => record_from(payload).and_then(|record| record.ok_or_else(bad)),
+            _ => typed_from(name, payload),
+        };
+    }
+    let mut object = Object::new();
+    for (key, value) in fields {
+        let key = if key.starts_with("$$") { &key[1..] } else { key.as_str() };
+        object.insert(key.to_owned(), from_json(value)?);
+    }
+    Ok(Value::Object(object))
+}
+
+/// A range, or `None` when the JSON is not one.
+fn range_from(payload: &Json) -> Result<Option<Value>, JsonError> {
+    if !payload.is_object() {
+        return Ok(None);
+    }
+    let mut bounds = [Bound::Unbounded, Bound::Unbounded];
+    for (bound, name) in bounds.iter_mut().zip(["start", "end"]) {
+        let Some(given) = field(payload, name) else {
+            continue;
+        };
+        *bound = match (field(given, "included"), field(given, "excluded")) {
+            (Some(value), None) => Bound::Included(from_json(value)?),
+            (None, Some(value)) => Bound::Excluded(from_json(value)?),
+            _ => return Ok(None),
+        };
+    }
+    let [start, end] = bounds;
+    Ok(Some(Value::Range(Box::new(Range { start, end }))))
+}
+
+/// A record, or `None` when the JSON is not one.
+fn record_from(payload: &Json) -> Result<Option<Value>, JsonError> {
+    let (Some(table), Some(key)) = (text_field(payload, "table"), field(payload, "key")) else {
+        return Ok(None);
+    };
+    let key = RecordIdKey::try_from(from_json(key)?).ok();
+    Ok(key.map(|key| Value::RecordId(RecordId { table, key })))
 }
 
 fn field<'j>(json: &'j Json, name: &str) -> Option<&'j Json> {
@@ -185,22 +317,13 @@ fn text_field(json: &Json, name: &str) -> Option<String> {
     Some(field(json, name)?.as_str()?.to_owned())
 }
 
-/// The value of the type `name` that `payload` holds.
+/// The value of the type `name` that `payload` holds, for the types that hold no other
+/// value.
 fn typed_from(name: &str, payload: &Json) -> Result<Value, JsonError> {
     let bad = || JsonError::BadValue(name.to_owned());
     let int = || payload.as_i64();
     let text = || payload.as_str();
     let number = |number: Option<Number>| number.map(Value::Number).ok_or_else(bad);
-    let bound = |name: &str| -> Result<Bound<Value>, JsonError> {
-        let Some(bound) = field(payload, name) else {
-            return Ok(Bound::Unbounded);
-        };
-        match (field(bound, "included"), field(bound, "excluded")) {
-            (Some(v), None) => Ok(Bound::Included(from_json(v)?)),
-            (None, Some(v)) => Ok(Bound::Excluded(from_json(v)?)),
-            _ => Err(bad()),
-        }
-    };
     match name {
         "none" => payload.is_null().then_some(Value::None).ok_or_else(bad),
         "i8" => number(int().and_then(|v| v.try_into().ok()).map(Number::I8)),
@@ -250,26 +373,13 @@ fn typed_from(name: &str, payload: &Json) -> Result<Value, JsonError> {
         "uuid" => text().and_then(|v| v.parse().ok()).map(Value::Uuid).ok_or_else(bad),
         "table" => text().map(|v| Value::Table(v.to_owned())).ok_or_else(bad),
         "regex" => text().map(|v| Value::Regex(v.to_owned())).ok_or_else(bad),
-        "record" => {
-            let table = text_field(payload, "table").ok_or_else(bad)?;
-            let key = from_json(field(payload, "key").ok_or_else(bad)?)?;
-            let key = RecordIdKey::try_from(key).map_err(|_| bad())?;
-            Ok(Value::RecordId(RecordId { table, key }))
-        }
         "file" => {
             let bucket = text_field(payload, "bucket").ok_or_else(bad)?;
             let key = text_field(payload, "key").ok_or_else(bad)?;
             Ok(Value::File(File { bucket, key }))
         }
-        "range" if payload.is_object() => {
-            Ok(Value::Range(Box::new(Range { start: bound("start")?, end: bound("end")? })))
-        }
-        "set" => match from_json(payload)? {
-            Value::Array(items) if payload.is_array() => Ok(Value::Set(items)),
-            _ => Err(bad()),
-        },
         "geometry" => geometry_from(payload).map(Value::Geometry).ok_or_else(bad),
-        "range" => Err(bad()),
+        "vector" => vector_from(payload).map(Value::Vector).ok_or_else(bad),
         _ => Err(JsonError::UnknownType(name.to_owned())),
     }
 }

@@ -102,8 +102,11 @@ pub mod ext {
     pub const SET: u8 = 23;
     /// `geometry`, payload array `[geometry kind, coordinates]`.
     pub const GEOMETRY: u8 = 24;
+    /// A vector of numbers of one type, as an embedding is: payload data, the type of the
+    /// elements in its first byte, then the elements. See [`crate::Vector`].
+    pub const VECTOR: u8 = 25;
     /// The greatest kind this version knows.
-    pub const MAX: u8 = GEOMETRY;
+    pub const MAX: u8 = VECTOR;
 
     /// The name of a kind, as SurrealDB spells the type.
     pub fn name(kind: u8) -> Option<&'static str> {
@@ -133,6 +136,7 @@ pub mod ext {
             REGEX => "regex",
             SET => "set",
             GEOMETRY => "geometry",
+            VECTOR => "vector",
             _ => return None,
         })
     }

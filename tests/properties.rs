@@ -94,6 +94,24 @@ fn record_key(inner: impl Strategy<Value = Value> + Clone) -> impl Strategy<Valu
     ]
 }
 
+fn vector() -> impl Strategy<Value = fleece::Vector> {
+    use fleece::Vector;
+    let single =
+        f32::POSITIVE | f32::NEGATIVE | f32::NORMAL | f32::SUBNORMAL | f32::ZERO | f32::INFINITE;
+    let half = any::<u16>().prop_filter("NaN", |bits| !F16(*bits).to_f64().is_nan());
+    prop_oneof![
+        vec(single, 0..12).prop_map(Vector::F32),
+        vec(double(), 0..6).prop_map(Vector::F64),
+        vec(half.prop_map(F16), 0..12).prop_map(Vector::F16),
+        vec(any::<i8>(), 0..12).prop_map(Vector::I8),
+        vec(any::<bool>(), 0..30).prop_map(|bits| {
+            let signs: Vec<core::primitive::f32> =
+                bits.iter().map(|bit| if *bit { 1.0 } else { -1.0 }).collect();
+            Vector::quantized_bits(&signs)
+        }),
+    ]
+}
+
 fn value() -> impl Strategy<Value = Value> {
     let nanos = 0..1_000_000_000u32;
     let leaf = prop_oneof![
@@ -117,6 +135,7 @@ fn value() -> impl Strategy<Value = Value> {
         ".{0,10}".prop_map(Value::Regex),
         ("[a-z]{0,6}", "/[a-z]{0,6}").prop_map(|(bucket, key)| Value::File(File { bucket, key })),
         geometry().prop_map(Value::Geometry),
+        vector().prop_map(Value::Vector),
     ];
     leaf.prop_recursive(4, 48, 6, |inner| {
         prop_oneof![

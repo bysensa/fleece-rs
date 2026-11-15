@@ -5,8 +5,9 @@ use std::ops::Bound;
 use crate::encoder::Encoder;
 use crate::error::{DecodeError, EncodeError};
 use crate::format::{MAX_DEPTH, ext};
-use crate::reader::{Doc, Item, ValueRef};
+use crate::reader::{ArrayRef, DictRef, Doc, Item, ValueRef};
 use crate::value::*;
+use crate::vector::VectorRef;
 
 /// The value as a document.
 pub fn encode(value: &Value) -> Result<Vec<u8>, EncodeError> {
@@ -122,6 +123,10 @@ impl Encoder<'_> {
             }
             Value::Object(fields) => self.write_object(fields),
             Value::Geometry(v) => self.write_geometry(v),
+            Value::Vector(v) => {
+                self.begin_ext(ext::VECTOR)?;
+                self.write_data_from(v.byte_len(), |out| v.write_bytes(out))
+            }
         }
     }
 
@@ -405,7 +410,17 @@ impl Payload {
         Ok(Range { start: bound(flags & 3, start)?, end: bound(flags >> 2, end)? })
     }
 
-    fn ext(&self, kind: u8, payload: ValueRef<'_>) -> Result<Value, DecodeError> {
+    fn record(&self, payload: ValueRef<'_>) -> Result<Value, DecodeError> {
+        let [table, key] = self.items(payload)?;
+        let key = decode_value(key, self.depth + 1)?;
+        let key = RecordIdKey::try_from(key).map_err(|_| self.error.clone())?;
+        Ok(Value::RecordId(RecordId { table: self.string(table)?, key }))
+    }
+
+    /// An extended value that holds no other value. The kinds that do are read by
+    /// [`decode_extended`], apart from this function, so that what is called once for
+    /// every level of a deep document stays small on the stack.
+    fn leaf(&self, kind: u8, payload: ValueRef<'_>) -> Result<Value, DecodeError> {
         let number = |number| Ok(Value::Number(number));
         match kind {
             ext::I8 => number(Number::I8(self.sized(payload)?)),
@@ -459,22 +474,14 @@ impl Payload {
             }
             ext::TABLE => Ok(Value::Table(self.string(payload)?)),
             ext::REGEX => Ok(Value::Regex(self.string(payload)?)),
-            ext::RECORD_ID => {
-                let [table, key] = self.items(payload)?;
-                let key = decode_value(key, self.depth + 1)?;
-                let key = RecordIdKey::try_from(key).map_err(|_| self.error.clone())?;
-                Ok(Value::RecordId(RecordId { table: self.string(table)?, key }))
-            }
             ext::FILE => {
                 let [bucket, key] = self.items(payload)?;
                 Ok(Value::File(File { bucket: self.string(bucket)?, key: self.string(key)? }))
             }
-            ext::RANGE => Ok(Value::Range(Box::new(self.range(payload)?))),
-            ext::SET => match decode_value(payload, self.depth)? {
-                Value::Array(items) => Ok(Value::Set(items)),
-                _ => Err(self.error.clone()),
-            },
-            ext::GEOMETRY => Ok(Value::Geometry(self.geometry(payload)?)),
+            ext::VECTOR => {
+                let vector = payload.as_data().and_then(VectorRef::parse);
+                Ok(Value::Vector(vector.ok_or(self.error.clone())?.to_vector()))
+            }
             _ => Err(self.error.clone()),
         }
     }
@@ -495,31 +502,58 @@ fn decode_value(value: ValueRef<'_>, depth: usize) -> Result<Value, DecodeError>
         Item::Float64(v) => Value::Number(Number::Float(v)),
         Item::String(v) => Value::String(v.to_owned()),
         Item::Data(v) => Value::Bytes(v.to_vec()),
-        Item::Array(_) | Item::Dict(_) if depth >= MAX_DEPTH => return Err(DecodeError::TooDeep),
-        Item::Array(array) => {
-            // The items go straight into a vector of their number, and the fields below
-            // straight into the map: collecting through a `Result` would first gather them
-            // in a vector that grows as it goes.
-            let mut items = Vec::with_capacity(array.len());
-            for item in array.iter() {
-                items.push(decode_value(item, depth + 1)?);
-            }
-            Value::Array(items)
-        }
-        Item::Dict(dict) => {
-            let mut fields = Object::new();
-            for (key, value) in dict.iter() {
-                fields.insert(key.to_owned(), decode_value(value, depth + 1)?);
-            }
-            Value::Object(fields)
-        }
+        Item::Array(array) => Value::Array(decode_items(array, depth)?),
+        Item::Dict(dict) => Value::Object(decode_fields(dict, depth)?),
         Item::Ext(ext::NONE, _) => Value::None,
-        Item::Ext(kind, Some(payload)) => {
-            Payload { error: DecodeError::BadPayload { pos, kind }, depth }.ext(kind, payload)?
-        }
+        Item::Ext(kind, Some(payload)) => return decode_extended(kind, payload, pos, depth),
         Item::Ext(..) | Item::Invalid => return Err(DecodeError::Malformed { pos }),
         Item::Undefined => return Err(DecodeError::Undefined { pos }),
     })
+}
+
+/// The items of an array, straight into a vector of their number: collecting through a
+/// `Result` would first gather them in a vector that grows as it goes.
+fn decode_items(array: ArrayRef<'_>, depth: usize) -> Result<Vec<Value>, DecodeError> {
+    if depth >= MAX_DEPTH {
+        return Err(DecodeError::TooDeep);
+    }
+    let mut items = Vec::with_capacity(array.len());
+    for item in array.iter() {
+        items.push(decode_value(item, depth + 1)?);
+    }
+    Ok(items)
+}
+
+fn decode_fields(dict: DictRef<'_>, depth: usize) -> Result<Object, DecodeError> {
+    if depth >= MAX_DEPTH {
+        return Err(DecodeError::TooDeep);
+    }
+    let mut fields = Object::new();
+    for (key, value) in dict.iter() {
+        fields.insert(key.to_owned(), decode_value(value, depth + 1)?);
+    }
+    Ok(fields)
+}
+
+/// An extended value. The kinds that hold other values are told apart here and each read
+/// by a function of its own; all the others, which end the descent, by [`Payload::leaf`].
+fn decode_extended(
+    kind: u8,
+    payload: ValueRef<'_>,
+    pos: usize,
+    depth: usize,
+) -> Result<Value, DecodeError> {
+    let read = Payload { error: DecodeError::BadPayload { pos, kind }, depth };
+    match kind {
+        ext::SET => match payload.as_array() {
+            Some(array) => Ok(Value::Set(decode_items(array, depth)?)),
+            None => Err(read.error),
+        },
+        ext::RANGE => Ok(Value::Range(Box::new(read.range(payload)?))),
+        ext::RECORD_ID => read.record(payload),
+        ext::GEOMETRY => Ok(Value::Geometry(read.geometry(payload)?)),
+        _ => read.leaf(kind, payload),
+    }
 }
 
 impl Value {

@@ -9,7 +9,7 @@ use std::ops::Bound;
 
 use fleece::{
     BigDecimal, Date, Datetime, Decimal, Duration, F16, File, Geometry, Interval, Number, Object,
-    Point, Range, RecordId, RecordIdKey, Time, Timestamp, Uuid, Value, decode, encode,
+    Point, Range, RecordId, RecordIdKey, Time, Timestamp, Uuid, Value, Vector, decode, encode,
 };
 
 fn hex(text: &str) -> Vec<u8> {
@@ -80,6 +80,25 @@ fn extended_numbers() {
         number(Number::BigDecimal("-1.50".parse::<BigDecimal>().unwrap())),
         "52 6a ff 00 31 0a 60 02 00 02 80 05 80 04",
     );
+}
+
+#[test]
+fn vectors() {
+    // The type of the elements, then the elements; for bits the unused bits of the last
+    // byte come between.
+    frozen(
+        Value::Vector(Vector::F32(vec![1.0, -2.0])),
+        "31 19 59 00 00 00 80 3f 00 00 00 c0 80 06",
+    );
+    frozen(Value::Vector(Vector::F64(vec![1.0])), "31 19 59 01 00 00 00 00 00 00 f0 3f 80 06");
+    frozen(Value::Vector(Vector::F16(vec![F16(0x3E00)])), "31 19 53 02 00 3e 80 03");
+    frozen(Value::Vector(Vector::I8(vec![-1, 127])), "31 19 53 03 ff 7f 80 03");
+    frozen(Value::Vector(Vector::Bits { bytes: vec![0xA1], len: 8 }), "31 19 53 04 00 a1 80 03");
+    frozen(
+        Value::Vector(Vector::Bits { bytes: vec![0xA1, 0x03], len: 10 }),
+        "31 19 54 04 06 a1 03 00 80 04",
+    );
+    frozen(Value::Vector(Vector::F32(vec![])), "31 19 51 00 80 02");
 }
 
 #[test]

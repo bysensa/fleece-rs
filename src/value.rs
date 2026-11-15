@@ -9,6 +9,8 @@ use std::fmt::{self, Display, Formatter};
 use std::ops::Bound;
 use std::str::FromStr;
 
+use crate::vector::Vector;
+
 /// An object: its fields by name.
 pub type Object = BTreeMap<String, Value>;
 
@@ -43,6 +45,9 @@ pub enum Value {
     Time(Time),
     Timestamp(Timestamp),
     Interval(Interval),
+    /// A vector of numbers of one type, as an embedding is. The one variant SurrealDB has
+    /// not: there a vector is an array of numbers.
+    Vector(Vector),
 }
 
 /// A number, of the kind it was written as.
@@ -70,15 +75,65 @@ pub struct F16(pub u16);
 impl F16 {
     /// The value as a double, which holds every `f16` exactly.
     pub fn to_f64(self) -> f64 {
-        let sign = if self.0 & 0x8000 != 0 { -1.0 } else { 1.0 };
-        let exponent = i32::from(self.0 >> 10 & 0x1F);
-        let fraction = f64::from(self.0 & 0x3FF);
-        sign * match exponent {
-            0 => fraction * 2f64.powi(-24),
-            31 if fraction == 0.0 => f64::INFINITY,
-            31 => f64::NAN,
-            _ => (1024.0 + fraction) * 2f64.powi(exponent - 25),
+        f64::from(self.to_f32())
+    }
+
+    /// The value as an `f32`, which holds every `f16` exactly: the bits are moved, and
+    /// nothing is computed.
+    pub fn to_f32(self) -> f32 {
+        // The three cases are all computed and one is chosen, with no table and no loop.
+        // After Fabian Giesen's `half_to_float_fast`.
+        const EXPONENT: u32 = 0x7C00 << 13;
+        // The fraction and the exponent where an f32 has them, the exponent 112 too low.
+        let moved = u32::from(self.0 & 0x7FFF) << 13;
+        let normal = moved + (112 << 23);
+        // An infinity or a NaN: the exponent of an f32 all ones, a NaN made quiet.
+        let quiet = if moved & 0x007F_FFFF != 0 { 0x0040_0000 } else { 0 };
+        let special = (normal + (112 << 23)) | quiet;
+        // A zero or a subnormal: as if it had the hidden bit, at the exponent of the
+        // smallest normal number, less that bit. The difference is exact.
+        let tiny = f32::from_bits(normal + (1 << 23)) - f32::from_bits(113 << 23);
+        let bits = match moved & EXPONENT {
+            EXPONENT => special,
+            0 => tiny.to_bits(),
+            _ => normal,
+        };
+        f32::from_bits(bits | u32::from(self.0 & 0x8000) << 16)
+    }
+
+    /// The `f16` nearest to `value`, a value halfway between two going to the one whose
+    /// last bit is zero. A value too large for an `f16` becomes an infinity.
+    pub fn from_f32(value: f32) -> Self {
+        let bits = value.to_bits();
+        let sign = (bits >> 16 & 0x8000) as u16;
+        let fraction = bits & 0x007F_FFFF;
+        // The exponent as an f16 would hold it: 1 to 30 for a normal number.
+        let exponent = (bits >> 23 & 0xFF) as i32 - 127 + 15;
+        if bits >> 23 & 0xFF == 0xFF {
+            // An infinity, or a NaN, which keeps the top of its payload and is made quiet.
+            let payload = if fraction == 0 { 0 } else { 0x0200 | (fraction >> 13) as u16 };
+            return Self(sign | 0x7C00 | payload);
         }
+        if exponent >= 31 {
+            return Self(sign | 0x7C00);
+        }
+        // Up by one when the bits dropped are more than half a step, or half a step with
+        // the last bit kept being odd. A carry runs on into the exponent, as it should.
+        let round = |kept: u32, all: u32, dropped: u32| {
+            let half = 1 << (dropped - 1);
+            let up = all & half != 0 && all & (3 * half - 1) != 0;
+            kept as u16 + u16::from(up)
+        };
+        if exponent <= 0 {
+            // A subnormal: the hidden bit comes into the fraction, which moves down.
+            let dropped = (14 - exponent) as u32;
+            if dropped > 24 {
+                return Self(sign);
+            }
+            let all = fraction | 0x0080_0000;
+            return Self(sign | round(all >> dropped, all, dropped));
+        }
+        Self(sign | (((exponent as u16) << 10 | (fraction >> 13) as u16) + round(0, fraction, 13)))
     }
 
     /// The `f16` equal to `value`, when there is one. A NaN gives the quiet NaN.

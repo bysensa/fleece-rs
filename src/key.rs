@@ -8,21 +8,31 @@
 //!
 //! # The order
 //!
-//! Values of different types sort by type, in the order SurrealDB gives its values: none,
-//! null, bool, number, string, duration, datetime, uuid, array, set, object, geometry,
-//! bytes, table, record, file, range, regex, date, time, timestamp, interval.
+//! The order is the one SurrealDB gives its values (`surrealdb_types::Value`), which the
+//! tests of this crate compare it with for every type.
 //!
-//! Numbers of every kind sort together by what they are worth, so `1i8`, `1` and `1.0` are
-//! one key, and the kind a number was written as is not kept. The layout is that of
-//! SurrealDB's `BigDecimal::encode_ordered`: a sign byte, the power of ten of the first
-//! digit, a byte for each decimal digit, a terminator, all but the sign byte complemented
-//! for a negative number. A float takes part with its exact value. The infinities and NaN,
-//! which that layout has no place for, sort below and above all numbers, NaN last.
+//! Values of different types sort by type: none, null, bool, number, string, duration,
+//! datetime, uuid, array, set, object, geometry, bytes, table and record, file, range,
+//! regex, date, time, timestamp, interval, and last the vector, which SurrealDB has not.
 //!
-//! Strings and bytes sort by their bytes, collections item by item with the shorter one
-//! first, an object by its fields in the order of their names. Geometries and intervals,
-//! for which SurrealDB documents no order, sort by their fields in the order they are
-//! declared in.
+//! - **Numbers** of every kind sort together by what they are worth, so `1i8`, `1` and `1.0`
+//!   are one key. The layout is that of SurrealDB's `BigDecimal::encode_ordered`: a sign
+//!   byte, the power of ten of the first digit, a byte for each decimal digit, a terminator,
+//!   all but the sign byte complemented for a negative number. A float takes part with its
+//!   exact value. The infinities sort below and above all numbers, and NaN last.
+//! - **Strings and bytes** sort by their bytes; **arrays** item by item, the shorter first;
+//!   an **object** by its fields in the order of their names.
+//! - A **set** sorts as its members in order, a member that is there twice counting once,
+//!   whatever order they were given in.
+//! - A **range** sorts by its start and then its end; of two bounds one that is not there
+//!   comes first, then every bound taken in by its value, then every bound left out.
+//! - An **interval** sorts by its length with a month of 30 days and a day of 24 hours,
+//!   and two intervals of one length are one key.
+//! - A **geometry** sorts by its kind, then by all its coordinates in a row (a polygon's
+//!   inner rings before its outer one), then by how they are grouped into rings.
+//! - A **table** sorts by its name just before the **records** of the table. SurrealDB
+//!   calls a table equal to each of its records, which bytes cannot be; every other
+//!   comparison of a table and a record is the same.
 //!
 //! An encoding is for comparing, not for reading back: it does not keep the kind of a
 //! number, and no decoder is given.
@@ -44,8 +54,8 @@ const SET: u8 = 0x0A;
 const OBJECT: u8 = 0x0B;
 const GEOMETRY: u8 = 0x0C;
 const BYTES: u8 = 0x0D;
+/// A table, and a record of it.
 const TABLE: u8 = 0x0E;
-const RECORD: u8 = 0x0F;
 const FILE: u8 = 0x10;
 const RANGE: u8 = 0x11;
 const REGEX: u8 = 0x12;
@@ -53,12 +63,13 @@ const DATE: u8 = 0x13;
 const TIME: u8 = 0x14;
 const TIMESTAMP: u8 = 0x15;
 const INTERVAL: u8 = 0x16;
+const VECTOR: u8 = 0x17;
 
-/// What ends a collection. Every item starts with a byte above it, so of two collections
-/// that agree as far as the shorter one goes, the shorter one sorts first.
+/// What ends a row of items. Every item starts with a byte above it, so of two rows that
+/// agree as far as the shorter one goes, the shorter one sorts first.
 const END: u8 = 0x00;
-/// What starts an entry of an object, a point or a ring, which have no type byte of their
-/// own to start with.
+/// What starts an item that has no type byte of its own to start with: an entry of an
+/// object, a point, a count.
 const ENTRY: u8 = 0x01;
 
 /// The bytes that sort as `value` does among all values.
@@ -80,7 +91,6 @@ pub fn encode_key_into(value: &Value, out: &mut Vec<u8>) {
         }
         Value::String(v) => tagged_text(STRING, v.as_bytes(), out),
         Value::Bytes(v) => tagged_text(BYTES, v, out),
-        Value::Table(v) => tagged_text(TABLE, v.as_bytes(), out),
         Value::Regex(v) => tagged_text(REGEX, v.as_bytes(), out),
         Value::Duration(v) => {
             out.push(DURATION);
@@ -102,20 +112,40 @@ pub fn encode_key_into(value: &Value, out: &mut Vec<u8>) {
             out.extend_from_slice(&v.nanos.to_be_bytes());
         }
         Value::Interval(v) => {
+            // A month of 30 days and a day of 24 hours, as SurrealDB compares intervals.
+            const DAY: i128 = 24 * 60 * 60 * 1_000_000;
+            let micros =
+                i128::from(v.months) * 30 * DAY + i128::from(v.days) * DAY + i128::from(v.micros);
             out.push(INTERVAL);
-            out.extend_from_slice(&signed(i64::from(v.months)));
-            out.extend_from_slice(&signed(i64::from(v.days)));
-            out.extend_from_slice(&signed(v.micros));
+            out.extend_from_slice(&(micros as u128 ^ 1 << 127).to_be_bytes());
         }
-        Value::Array(items) => list(ARRAY, items, out),
-        Value::Set(items) => list(SET, items, out),
+        Value::Array(items) => {
+            out.push(ARRAY);
+            for item in items {
+                encode_key_into(item, out);
+            }
+            out.push(END);
+        }
+        Value::Set(items) => {
+            // In order and each once, whatever was given: the set SurrealDB keeps.
+            let mut members: Vec<Vec<u8>> = items.iter().map(encode_key).collect();
+            members.sort_unstable();
+            members.dedup();
+            out.push(SET);
+            members.iter().for_each(|member| out.extend_from_slice(member));
+            out.push(END);
+        }
         Value::Object(fields) => {
             out.push(OBJECT);
             object(fields, out);
         }
+        Value::Table(v) => {
+            tagged_text(TABLE, v.as_bytes(), out);
+            out.push(END);
+        }
         Value::RecordId(v) => {
-            out.push(RECORD);
-            text(v.table.as_bytes(), out);
+            tagged_text(TABLE, v.table.as_bytes(), out);
+            out.push(ENTRY);
             record_key(&v.key, out);
         }
         Value::File(v) => {
@@ -125,11 +155,20 @@ pub fn encode_key_into(value: &Value, out: &mut Vec<u8>) {
         }
         Value::Range(v) => {
             out.push(RANGE);
-            bounds(&v.start, &v.end, out, encode_key_into);
+            bound(&v.start, out, encode_key_into);
+            bound(&v.end, out, encode_key_into);
         }
         Value::Geometry(v) => {
             out.push(GEOMETRY);
             geometry(v, out);
+        }
+        Value::Vector(v) => {
+            out.push(VECTOR);
+            for element in v.to_f32() {
+                out.push(ENTRY);
+                out.extend_from_slice(&float(f64::from(element)));
+            }
+            out.push(END);
         }
     }
 }
@@ -163,14 +202,6 @@ fn tagged_text(tag: u8, bytes: &[u8], out: &mut Vec<u8>) {
     text(bytes, out);
 }
 
-fn list(tag: u8, items: &[Value], out: &mut Vec<u8>) {
-    out.push(tag);
-    for item in items {
-        encode_key_into(item, out);
-    }
-    out.push(END);
-}
-
 fn object(fields: &Object, out: &mut Vec<u8>) {
     for (key, value) in fields {
         out.push(ENTRY);
@@ -180,26 +211,19 @@ fn object(fields: &Object, out: &mut Vec<u8>) {
     out.push(END);
 }
 
-/// The two ends of a range. A start without a bound is before every start, an end without
-/// one after every end. Two bounds sort by their values first; of a value taken in and the
-/// same value left out, the one that makes the range reach farther down, or less far up,
-/// sorts first.
-fn bounds<T>(start: &Bound<T>, end: &Bound<T>, out: &mut Vec<u8>, put: impl Fn(&T, &mut Vec<u8>)) {
-    match start {
+/// One end of a range: none first, then every bound taken in by its value, then every
+/// bound left out by its value, for a start and for an end alike.
+fn bound<T>(bound: &Bound<T>, out: &mut Vec<u8>, put: impl Fn(&T, &mut Vec<u8>)) {
+    match bound {
         Bound::Unbounded => out.push(0x01),
-        Bound::Included(value) | Bound::Excluded(value) => {
+        Bound::Included(value) => {
             out.push(0x02);
             put(value, out);
-            out.push(if matches!(start, Bound::Included(_)) { 0x01 } else { 0x02 });
         }
-    }
-    match end {
-        Bound::Included(value) | Bound::Excluded(value) => {
-            out.push(0x01);
+        Bound::Excluded(value) => {
+            out.push(0x03);
             put(value, out);
-            out.push(if matches!(end, Bound::Excluded(_)) { 0x01 } else { 0x02 });
         }
-        Bound::Unbounded => out.push(0x02),
     }
 }
 
@@ -214,26 +238,34 @@ fn record_key(key: &RecordIdKey, out: &mut Vec<u8>) {
             out.push(0x03);
             out.extend_from_slice(&v.0);
         }
-        RecordIdKey::Array(items) => list(0x04, items, out),
+        RecordIdKey::Array(items) => {
+            out.push(0x04);
+            for item in items {
+                encode_key_into(item, out);
+            }
+            out.push(END);
+        }
         RecordIdKey::Object(fields) => {
             out.push(0x05);
             object(fields, out);
         }
         RecordIdKey::Range(range) => {
             out.push(0x06);
-            bounds(&range.start, &range.end, out, record_key);
+            bound(&range.start, out, record_key);
+            bound(&range.end, out, record_key);
         }
     }
 }
 
-/// A double as 8 bytes that sort as the doubles do.
+/// A double as 8 bytes that sort as `f64::total_cmp` does, the two zeros being one.
 fn float(value: f64) -> [u8; 8] {
-    let bits = value.to_bits();
+    let bits = if value == 0.0 { 0 } else { value.to_bits() };
     // A negative double sorts by its bits backwards, a positive one above every negative.
     (if bits >> 63 == 1 { !bits } else { bits ^ 1 << 63 }).to_be_bytes()
 }
 
-fn points(points: &[Point], out: &mut Vec<u8>) {
+/// The coordinates of a geometry in a row, which is what it sorts by first.
+fn coordinates<'p>(points: impl Iterator<Item = &'p Point>, out: &mut Vec<u8>) {
     for point in points {
         out.push(ENTRY);
         out.extend_from_slice(&float(point.x));
@@ -242,47 +274,57 @@ fn points(points: &[Point], out: &mut Vec<u8>) {
     out.push(END);
 }
 
-fn rings<'p>(rings: impl Iterator<Item = &'p Vec<Point>>, out: &mut Vec<u8>) {
-    for ring in rings {
+/// Counts in a row: how the coordinates are grouped, which geometries of the same
+/// coordinates sort by.
+fn counts(counts: impl Iterator<Item = usize>, out: &mut Vec<u8>) {
+    for count in counts {
         out.push(ENTRY);
-        points(ring, out);
+        out.extend_from_slice(&(count as u64).to_be_bytes());
     }
     out.push(END);
 }
 
-fn polygon(polygon: &Polygon, out: &mut Vec<u8>) {
-    rings(std::iter::once(&polygon.exterior).chain(&polygon.interiors), out);
+/// The points of a polygon, its inner rings before its outer one.
+fn polygon_points(polygon: &Polygon) -> impl Iterator<Item = &Point> {
+    polygon.interiors.iter().chain(std::iter::once(&polygon.exterior)).flatten()
+}
+
+/// The number of inner rings of a polygon, the length of each, and that of the outer one.
+fn polygon_shape(polygon: &Polygon) -> impl Iterator<Item = usize> + '_ {
+    std::iter::once(polygon.interiors.len())
+        .chain(polygon.interiors.iter().map(Vec::len))
+        .chain(std::iter::once(polygon.exterior.len()))
 }
 
 fn geometry(shape: &Geometry, out: &mut Vec<u8>) {
     match shape {
         Geometry::Point(point) => {
             out.push(0x01);
-            points(std::slice::from_ref(point), out);
+            coordinates(std::iter::once(point), out);
         }
         Geometry::Line(line) => {
             out.push(0x02);
-            points(line, out);
+            coordinates(line.iter(), out);
         }
-        Geometry::Polygon(shape) => {
+        Geometry::Polygon(polygon) => {
             out.push(0x03);
-            polygon(shape, out);
+            coordinates(polygon_points(polygon), out);
+            counts(polygon_shape(polygon), out);
         }
-        Geometry::MultiPoint(shape) => {
+        Geometry::MultiPoint(points) => {
             out.push(0x04);
-            points(shape, out);
+            coordinates(points.iter(), out);
         }
         Geometry::MultiLine(lines) => {
             out.push(0x05);
-            rings(lines.iter(), out);
+            coordinates(lines.iter().flatten(), out);
+            counts(lines.iter().map(Vec::len), out);
         }
         Geometry::MultiPolygon(polygons) => {
             out.push(0x06);
-            for shape in polygons {
-                out.push(ENTRY);
-                polygon(shape, out);
-            }
-            out.push(END);
+            coordinates(polygons.iter().flat_map(polygon_points), out);
+            let shapes = polygons.iter().flat_map(polygon_shape);
+            counts(std::iter::once(polygons.len()).chain(shapes), out);
         }
         Geometry::Collection(geometries) => {
             out.push(0x07);

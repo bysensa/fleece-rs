@@ -248,6 +248,7 @@ dependencies = [
 name = "fleece"
 version = "0.1.0"
 dependencies = [
+ "geo-types",
  "half",
  "num-bigint",
  "proptest",

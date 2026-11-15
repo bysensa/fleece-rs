@@ -30,6 +30,7 @@ required-features = ["json"]
 [dev-dependencies]
 proptest = "1"
 # The crates SurrealDB holds these types with: the layouts here are checked against them.
+geo-types = "0.7"
 half = "2"
 num-bigint = "0.4"
 rust_decimal = "1"

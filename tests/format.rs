@@ -233,6 +233,80 @@ fn documents_that_are_not_well_formed_are_refused() {
     assert_eq!(refused("00 01 60 01 c0 02 80 02"), DecodeError::BadPointer { pos: 4 });
 }
 
+/// Everything that walks a document, on the deepest documents there are, in a thread of
+/// half the stack a thread gets by default (1 MiB of 2) and in a build without
+/// optimization, where every call takes the most stack it ever does.
+#[test]
+fn the_deepest_documents_are_walked_without_running_out_of_stack() {
+    use std::ops::Bound;
+
+    let deep = |wrap: &dyn Fn(Value) -> Value, levels: usize| {
+        (0..levels).fold(Value::from(1), |inner, _| wrap(inner))
+    };
+    let range = |inner: Value| {
+        Value::Range(Box::new(fleece::Range {
+            start: Bound::Included(inner),
+            end: Bound::Unbounded,
+        }))
+    };
+    let record = |inner: Value| {
+        let key = fleece::RecordIdKey::Array(vec![inner]);
+        Value::RecordId(fleece::RecordId { table: "t".into(), key })
+    };
+    let object = |inner: Value| Value::Object(Object::from([("k".to_owned(), inner)]));
+    let mut geometry = fleece::Geometry::Point(fleece::Point { x: 1.0, y: 2.0 });
+    // A collection of geometries is two collections, and the point in the middle one.
+    for _ in 0..fleece::MAX_DEPTH / 2 - 1 {
+        geometry = fleece::Geometry::Collection(vec![geometry]);
+    }
+    let values = [
+        deep(&|inner| Value::Array(vec![inner]), fleece::MAX_DEPTH),
+        deep(&object, fleece::MAX_DEPTH),
+        deep(&|inner| Value::Set(vec![inner]), fleece::MAX_DEPTH),
+        deep(&range, fleece::MAX_DEPTH),
+        // A record with an array for its key is two collections.
+        deep(&record, fleece::MAX_DEPTH / 2),
+        Value::Geometry(geometry),
+    ];
+    // Bytes that are not a document one may write: arrays nested far past the limit, as
+    // only bytes that are not trusted hold them. Reading them ends, in an error or short.
+    let mut too_deep = vec![0x00, 0x01];
+    for level in 0..5000 {
+        // An array of one item: the integer the first time, then the array before it.
+        too_deep.extend_from_slice(&[0x60, 0x01, 0x80, if level == 0 { 0x02 } else { 0x03 }]);
+    }
+    too_deep.extend_from_slice(&[0x80, 0x02]);
+    let walk = move || {
+        assert_eq!(Doc::new(&too_deep).unwrap_err(), DecodeError::TooDeep);
+        let unchecked = Doc::trusted(&too_deep);
+        assert_eq!(Value::from_ref(unchecked.root()), Err(DecodeError::TooDeep));
+        assert!(!dump(&unchecked).is_empty());
+        assert!(unchecked.live_bytes() <= too_deep.len());
+        assert!(fleece::compact(&unchecked).is_err());
+        assert!(fleece::update(&unchecked, &fleece::Patch::new()).is_err());
+        for value in &values {
+            let bytes = encode(value).unwrap();
+            let doc = Doc::new(&bytes).unwrap();
+            assert_eq!(&Value::from_ref(doc.root()).unwrap(), value);
+            assert!(!dump(&doc).is_empty());
+            assert_eq!(doc.live_bytes(), bytes.len());
+            assert_eq!(fleece::compact(&doc).unwrap(), bytes);
+            assert_eq!(fleece::update(&doc, &fleece::Patch::new()).unwrap(), bytes);
+            assert!(fleece::Kind::Any.conforms(doc.root()));
+            assert!(!fleece::key::encode_key(value).is_empty());
+            #[cfg(feature = "json")]
+            assert_eq!(&fleece::json::from_json(&fleece::json::to_json(value)).unwrap(), value);
+            // One level more is refused, not attempted.
+            let deeper = Value::Array(vec![value.clone()]);
+            if matches!(value, Value::Array(_) | Value::Object(_) | Value::Set(_)) {
+                assert_eq!(encode(&deeper), Err(EncodeError::TooDeep));
+            }
+        }
+    };
+    let thread = std::thread::Builder::new().stack_size(1 << 20).spawn(walk).unwrap();
+    thread.join().unwrap();
+}
+
 #[test]
 fn a_small_document_cannot_stand_for_an_endless_one() {
     // Each array holds the one before it 16 times: 16^10 values in 400 bytes.

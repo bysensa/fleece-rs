@@ -16,6 +16,8 @@
 //!   left behind;
 //! - [`update`] with [`Patch`], and [`extract`]: a document changed by paths, and a part of
 //!   one, without decoding it;
+//! - [`Vector`] and [`VectorRef`]: embeddings stored tightly and compared with a query
+//!   where they lie;
 //! - [`Kind`]: the kinds of SurrealDB, and whether a value in a document is of one;
 //! - [`key`]: values as keys of an ordered store, for indexes;
 //! - [`serde`](mod@crate::serde) (feature `serde`): the types of an application to documents and back;
@@ -123,6 +125,7 @@ pub mod serde;
 mod shared_keys;
 mod update;
 mod value;
+mod vector;
 
 pub use codec::{decode, encode};
 pub use compact::compact;
@@ -140,3 +143,4 @@ pub use value::{
     ParseError, Point, Polygon, Range, RecordId, RecordIdKey, RecordIdKeyRange, Time, Timestamp,
     Uuid, Value,
 };
+pub use vector::{Element, Vector, VectorRef};

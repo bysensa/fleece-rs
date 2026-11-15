@@ -163,6 +163,52 @@ fn main() {
     let with_shared = encoder.finish().unwrap().len();
     println!("\none record: {one_len} bytes, {with_shared} with shared keys");
 
+    // An embedding in a document: what it takes, and what a distance to a query costs
+    // where it lies, against decoding it first.
+    println!();
+    let embedding: Vec<f32> = (0..768).map(|i| ((i * 37 % 101) as f32 - 50.0) / 400.0).collect();
+    let query: Vec<f32> = (0..768).map(|i| ((i * 53 % 97) as f32 - 48.0) / 400.0).collect();
+    let note = |vector: fleece::Vector| {
+        let fields = [
+            ("title".to_owned(), Value::from("Tintin in Tibet")),
+            ("embedding".to_owned(), Value::Vector(vector)),
+        ];
+        encode(&Value::Object(Object::from(fields))).unwrap()
+    };
+    let array = Value::Array(embedding.iter().map(|v| Value::Number(Number::F32(*v))).collect());
+    println!("768 dimensions as an array of f32: {} bytes", encode(&array).unwrap().len());
+    let vector_path: KeyPath = "embedding".parse().unwrap();
+    for (name, vector) in [
+        ("f32", fleece::Vector::F32(embedding.clone())),
+        ("f16", fleece::Vector::quantized_f16(&embedding)),
+        ("i8", fleece::Vector::quantized_i8(&embedding)),
+        ("bits", fleece::Vector::quantized_bits(&embedding)),
+    ] {
+        let stored = note(vector);
+        let label = format!("vector {name}, {} bytes: dot in place", stored.len());
+        measure(&label, stored.len(), || {
+            let field = vector_path.eval(Doc::trusted(&stored).root()).unwrap();
+            field.as_vector().unwrap().dot(&query).unwrap()
+        });
+    }
+    let stored = note(fleece::Vector::F32(embedding.clone()));
+    measure("vector f32: cosine in place", stored.len(), || {
+        let field = vector_path.eval(Doc::trusted(&stored).root()).unwrap();
+        field.as_vector().unwrap().cosine(&query).unwrap()
+    });
+    measure("vector f32: decode the document, then dot", stored.len(), || {
+        let Value::Object(fields) = Value::from_ref(Doc::trusted(&stored).root()).unwrap() else {
+            unreachable!()
+        };
+        let Some(Value::Vector(fleece::Vector::F32(values))) = fields.get("embedding") else {
+            unreachable!()
+        };
+        values.iter().zip(&query).map(|(a, b)| a * b).sum::<f32>()
+    });
+    measure("plain slices: dot of 768 f32, one sum", 768 * 4, || {
+        black_box(&embedding).iter().zip(black_box(&query)).map(|(a, b)| a * b).sum::<f32>()
+    });
+
     println!();
     for depth in [25, 50, 100] {
         let (old, new) = (nested(depth, 1), nested(depth, 2));

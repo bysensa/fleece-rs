@@ -45,6 +45,7 @@ use crate::error::{DecodeError, EncodeError};
 use crate::format::ext;
 use crate::reader::{ArrayRef, DictIter, Doc, Item, ValueRef};
 use crate::value::*;
+use crate::vector::Vector;
 
 /// The name of the newtype a value of this crate passes through `serde` as: its contents
 /// are the bytes of a document that holds the value.
@@ -972,4 +973,5 @@ as_value! {
     File: "file", Value::File, Value::File(v) => v;
     Geometry: "geometry", Value::Geometry, Value::Geometry(v) => v;
     Range: "range", |v| Value::Range(Box::new(v)), Value::Range(v) => *v;
+    Vector: "vector", Value::Vector, Value::Vector(v) => v;
 }
