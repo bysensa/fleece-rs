@@ -41,6 +41,12 @@ pub(crate) const MAX_NARROW_OFFSET: usize = 0x3FFF * 2;
 /// The farthest a pointer of a wide collection reaches back, in bytes.
 pub(crate) const MAX_WIDE_OFFSET: usize = 0x3FFF_FFFF * 2;
 
+/// The version of the bytes this crate writes: the layout of standard Fleece and the kinds of
+/// [`ext`] with their payloads. Documents carry no version of their own; an application keeps
+/// this number once beside the documents it stores, and so knows what wrote them. It goes up
+/// when a value is written as other bytes than before, and never when a kind is only added.
+pub const FORMAT_VERSION: u32 = 1;
+
 /// How deep collections may nest, in a document read and in a value written.
 pub const MAX_DEPTH: usize = 128;
 

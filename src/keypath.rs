@@ -6,7 +6,7 @@ use std::str::FromStr;
 use crate::reader::ValueRef;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Step {
+pub(crate) enum Step {
     Key(String),
     Index(i64),
 }
@@ -92,6 +92,10 @@ impl FromStr for KeyPath {
 }
 
 impl KeyPath {
+    pub(crate) fn steps(&self) -> &[Step] {
+        &self.steps
+    }
+
     /// The value the path leads to from `root`, or `None` when a key is missing, an index is
     /// out of range or a value on the way is not a collection of the kind the step takes.
     pub fn eval<'a>(&self, root: ValueRef<'a>) -> Option<ValueRef<'a>> {

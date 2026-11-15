@@ -127,6 +127,42 @@ fn main() {
         compact(&Doc::trusted(&appended)).unwrap()
     });
 
+    // A change as a store of whole values needs it: the new document, compact.
+    let (path, age): (KeyPath, _) = ("[500].age".parse().unwrap(), Value::Number(Number::U8(99)));
+    let mut patch = fleece::Patch::new();
+    patch.set(&path, &age);
+    measure("fleece: update one field without a decode", bytes.len(), || {
+        fleece::update(&Doc::trusted(&bytes), &patch).unwrap()
+    });
+    measure("fleece: decode, change, encode", bytes.len(), || {
+        let Value::Array(mut records) = Value::from_ref(Doc::trusted(&bytes).root()).unwrap()
+        else {
+            unreachable!()
+        };
+        let Value::Object(fields) = &mut records[500] else { unreachable!() };
+        fields.insert("age".to_owned(), age.clone());
+        encode(&Value::Array(records)).unwrap()
+    });
+    let one_bytes = encode(&one).unwrap();
+    let (one_path, _): (KeyPath, ()) = ("age".parse().unwrap(), ());
+    let mut one_patch = fleece::Patch::new();
+    one_patch.set(&one_path, &age);
+    measure("fleece: update one field of one record", one_bytes.len(), || {
+        fleece::update(&Doc::trusted(&one_bytes), &one_patch).unwrap()
+    });
+    measure("fleece: key of an index entry (a string)", 20, || {
+        fleece::key::encode_key(&Value::from("user500@example.com"))
+    });
+    measure("fleece: key of an index entry (a float)", 8, || {
+        fleece::key::encode_key(&Value::from(185.37))
+    });
+
+    let mut shared = fleece::SharedKeys::new();
+    let mut encoder = fleece::Encoder::new().with_shared_keys(&mut shared);
+    encoder.write_value(&one).unwrap();
+    let with_shared = encoder.finish().unwrap().len();
+    println!("\none record: {one_len} bytes, {with_shared} with shared keys");
+
     println!();
     for depth in [25, 50, 100] {
         let (old, new) = (nested(depth, 1), nested(depth, 2));

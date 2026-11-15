@@ -622,6 +622,26 @@ impl<'a> DictRef<'a> {
         Some(ValueRef { doc: self.doc, pos: self.slot(2 * entry + 1)? })
     }
 
+    /// Whether [`DictRef::iter`], which gave `entries` entries, gave them all: it leaves out
+    /// an entry whose key cannot be read, which a copy of the dictionary must not lose
+    /// without a word.
+    pub(crate) fn gave_all(&self, entries: usize) -> bool {
+        if !self.inherits() {
+            return entries == self.count;
+        }
+        // Entries hide one another along the dictionaries inherited from, so each of
+        // these is asked for its own.
+        let mut dict = Some(*self);
+        while let Some(current) = dict {
+            let mut own = usize::from(current.inherits())..current.count;
+            if !own.all(|entry| current.entry(entry).is_some()) {
+                return false;
+            }
+            dict = current.parent();
+        }
+        true
+    }
+
     /// Whether the first entry points at a dictionary this one inherits from.
     fn inherits(&self) -> bool {
         self.count > 0 && self.key_at(0) == Some(Key::Int(PARENT_KEY))

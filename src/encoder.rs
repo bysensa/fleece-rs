@@ -605,9 +605,15 @@ impl<'k> Encoder<'k> {
             }
             Item::Dict(dict) => {
                 self.begin_dict()?;
+                let mut entries = 0;
                 for (key, value) in dict.iter() {
                     self.write_key(key)?;
                     self.write_copy(value)?;
+                    entries += 1;
+                }
+                // An entry whose key could not be read is not to be lost in the copy.
+                if !dict.gave_all(entries) {
+                    return Err(EncodeError::InvalidValue);
                 }
                 self.end_dict()
             }

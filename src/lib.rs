@@ -14,6 +14,11 @@
 //! - [`delta`]: the difference between two values, as bytes to append or as a value;
 //! - [`compact`]: a document that grew by appended deltas written anew without what they
 //!   left behind;
+//! - [`update`] with [`Patch`], and [`extract`]: a document changed by paths, and a part of
+//!   one, without decoding it;
+//! - [`Kind`]: the kinds of SurrealDB, and whether a value in a document is of one;
+//! - [`key`]: values as keys of an ordered store, for indexes;
+//! - [`serde`](mod@crate::serde) (feature `serde`): the types of an application to documents and back;
 //! - [`KeyPath`]: `foo.bar[2].baz` into a document;
 //! - [`json`] (feature `json`): JSON to values and back;
 //! - [`dump`]: a listing of a document by address.
@@ -46,6 +51,57 @@
 //! # }
 //! ```
 
+//!
+//! # Documents in a store
+//!
+//! A key-value store keeps a document as one value. What follows from that:
+//!
+//! - **Read in place.** A store lends the bytes of a value (a closure over `&[u8]`, a
+//!   cursor). [`Doc::trusted`] over them reads a field without a copy and without a pass
+//!   over the document; nothing is allocated. Reading never panics and never leaves the
+//!   bytes, whatever they are.
+//! - **Check at the door.** [`Doc::new`] passes over the whole document once. Do it where
+//!   bytes come in from outside; what the application wrote itself needs no check on every
+//!   read.
+//! - **Change by [`update`].** The store writes a value whole on every change, so an
+//!   appended delta saves nothing there: what a change costs is making the new bytes, which
+//!   [`update`] does from the old ones without a [`Value`] in between. Appended deltas are
+//!   for sending a change and for logs.
+//! - **Index by [`key`].** The bytes of documents do not sort; the key of an index entry is
+//!   [`key::encode_key`] of the indexed field, followed by the key of the document.
+//! - **Keep the version.** Documents carry no version. Store [`FORMAT_VERSION`] once beside
+//!   them.
+//! - **Shared keys travel with the documents.** A table of [`SharedKeys`] is stored in the
+//!   same transaction as the document that grew it, and a write that failed takes its keys
+//!   back with [`SharedKeys::truncate`].
+//! - **Large binary data stays outside.** Every change of a document writes all of it.
+//!
+//! ```
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! use fleece::{Doc, Object, Patch, Value};
+//!
+//! let dog = |visits: i64| {
+//!     let fields = [("name".to_owned(), Value::from("Milou")), ("visits".to_owned(), visits.into())];
+//!     Value::Object(Object::from(fields))
+//! };
+//! // What a store lends for a key, and what the application does with it.
+//! let stored = fleece::encode(&dog(41))?;
+//! let doc = Doc::trusted(&stored);
+//! let visits = doc.root().as_dict().and_then(|dict| dict.get("visits")?.as_i64());
+//!
+//! let (path, more) = ("visits".parse()?, Value::from(visits.unwrap_or(0) + 1));
+//! let mut patch = Patch::new();
+//! patch.set(&path, &more);
+//! let to_store = fleece::update(&doc, &patch)?;
+//!
+//! // The entry of an index over `name`: bytes that sort as the names do.
+//! let index_key = fleece::key::encode_key(&Value::from("Milou"));
+//! # assert_eq!(fleece::decode(&to_store)?, dog(42));
+//! # assert!(index_key < fleece::key::encode_key(&Value::from("Tintin")));
+//! # Ok(())
+//! # }
+//! ```
+
 #![forbid(unsafe_code)]
 
 mod codec;
@@ -58,9 +114,14 @@ mod format;
 mod hash;
 #[cfg(feature = "json")]
 pub mod json;
+pub mod key;
 mod keypath;
+mod kind;
 mod reader;
+#[cfg(feature = "serde")]
+pub mod serde;
 mod shared_keys;
+mod update;
 mod value;
 
 pub use codec::{decode, encode};
@@ -68,10 +129,12 @@ pub use compact::compact;
 pub use dump::dump;
 pub use encoder::Encoder;
 pub use error::{DecodeError, DeltaError, EncodeError};
-pub use format::{MAX_DEPTH, ext};
+pub use format::{FORMAT_VERSION, MAX_DEPTH, ext};
 pub use keypath::{KeyPath, KeyPathError};
+pub use kind::{GeometryKind, Kind, KindLiteral};
 pub use reader::{ArrayRef, DictIter, DictRef, Doc, Item, ValueRef};
 pub use shared_keys::SharedKeys;
+pub use update::{Patch, extract, update};
 pub use value::{
     BigDecimal, Date, Datetime, Decimal, Duration, F16, File, Geometry, Interval, Number, Object,
     ParseError, Point, Polygon, Range, RecordId, RecordIdKey, RecordIdKeyRange, Time, Timestamp,

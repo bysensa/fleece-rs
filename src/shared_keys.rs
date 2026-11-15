@@ -60,6 +60,18 @@ impl SharedKeys {
         Some(number)
     }
 
+    /// Forgets the keys added since the table had `len` keys.
+    ///
+    /// A table grows while a document is written, and the document and the table have to
+    /// reach the store together. When the write of the document fails, or its transaction is
+    /// tried again, the keys it added are taken back with the length the table had before,
+    /// so that their numbers are not given to other keys by someone else meanwhile.
+    pub fn truncate(&mut self, len: usize) {
+        for key in self.keys.drain(len.min(self.keys.len())..) {
+            self.numbers.remove(&key);
+        }
+    }
+
     /// The key with this number.
     pub fn decode(&self, number: u16) -> Option<&str> {
         self.keys.get(usize::from(number)).map(|key| &**key)

@@ -282,7 +282,7 @@ fn negate(bytes: &mut [u8]) {
 }
 
 /// The decimal digits of a number of 32-bit digits, the lowest first.
-fn decimal_digits(mut limbs: Vec<u32>) -> String {
+pub(crate) fn decimal_digits(mut limbs: Vec<u32>) -> String {
     const GROUP: u64 = 1_000_000_000;
     // Each division by 10^9 takes the 9 lowest decimal digits off the number.
     let mut groups = Vec::new();

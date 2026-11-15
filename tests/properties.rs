@@ -149,7 +149,34 @@ proptest! {
     fn a_value_reads_back_as_written(value in value()) {
         let bytes = encode(&value).unwrap();
         prop_assert_eq!(bytes.len() % 2, 0);
-        prop_assert_eq!(decode(&bytes).unwrap(), value);
+        prop_assert_eq!(decode(&bytes).unwrap(), value.clone());
+        // Every value has a key, and the same value the same key.
+        prop_assert_eq!(fleece::key::encode_key(&value), fleece::key::encode_key(&value.clone()));
+    }
+
+    #[test]
+    fn an_update_is_what_changing_the_value_gives((mut record, changes) in record_and_changes()) {
+        let mut bytes = encode(&Value::Object(record.clone())).unwrap();
+        for change in changes {
+            let paths: Vec<KeyPath> = change.iter().map(|(key, _)| key.parse().unwrap()).collect();
+            let mut patch = fleece::Patch::new();
+            for (path, (key, value)) in paths.iter().zip(&change) {
+                match value {
+                    Some(value) => {
+                        patch.set(path, value);
+                        record.insert(key.clone(), value.clone());
+                    }
+                    None => {
+                        patch.remove(path);
+                        record.remove(key);
+                    }
+                }
+            }
+            bytes = fleece::update(&Doc::new(&bytes).unwrap(), &patch).unwrap();
+            prop_assert_eq!(decode(&bytes).unwrap(), Value::Object(record.clone()));
+            // Nothing is left of what was replaced.
+            prop_assert_eq!(Doc::new(&bytes).unwrap().live_bytes(), bytes.len());
+        }
     }
 
     #[test]
