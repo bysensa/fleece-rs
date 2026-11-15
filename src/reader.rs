@@ -8,8 +8,10 @@ use crate::format::*;
 use crate::hash::Seeds;
 use crate::shared_keys::SharedKeys;
 
-/// The most values a document may expand to once every pointer is followed. Values shared by
-/// pointers count once per use, so that a small document cannot stand for an endless one.
+/// The most values a document of any size may expand to once every pointer is followed.
+/// Values shared by pointers count once per use, so that a small document cannot stand for
+/// an endless one. A document is held to less than this: to one value for every two of its
+/// bytes, see [`Doc::validate`].
 const MAX_VALUES: u64 = 1 << 26;
 
 /// An encoded document: its bytes, the base it was appended to, and its shared keys.
@@ -221,7 +223,15 @@ impl<'a> Doc<'a> {
 
     /// Checks the whole document: every value reachable from the root lies inside the bytes,
     /// every pointer leads back to a value, strings are UTF-8, dictionary keys are sorted and
-    /// unique, extended values have a known kind, and nesting and size stay within limits.
+    /// unique, extended values have a known kind and a payload of its form, nothing is
+    /// undefined but an entry a dictionary deletes from the one it inherits, and nesting and
+    /// size stay within limits. A document that passes is one [`crate::decode`] takes.
+    ///
+    /// The document may expand to one value for every two of its bytes, the base included.
+    /// A value takes two bytes at least where it is used, so a document without a
+    /// collection that many pointers lead to stays under that; pointers that would make a
+    /// small document stand for a large one go over it. What a dictionary hides in the one
+    /// it inherits from is not counted: no reader comes to it.
     pub fn validate(&self) -> Result<(), DecodeError> {
         if self.data.len() < 2 || self.data.len() & 1 == 1 || self.base.len() & 1 == 1 {
             return Err(DecodeError::Truncated);
@@ -232,6 +242,7 @@ impl<'a> Doc<'a> {
             // Room for a collection in every 64 bytes, which few documents exceed.
             seen: HashMap::with_capacity_and_hasher(self.end() / 64, Seeds::random()),
             strings: vec![0; self.end() / 128 + 1],
+            most: MAX_VALUES.min(self.end() as u64 / 2),
         };
         let (root, limit) = if self.is_pointer(end) {
             let target = validator.pointer(end, false, true)?;
@@ -254,6 +265,8 @@ struct Validator<'d, 'a> {
     seen: HashMap<usize, (u64, usize), Seeds>,
     /// A bit for each even position: the string a pointer leads to there is UTF-8.
     strings: Vec<u64>,
+    /// The most values the document may expand to.
+    most: u64,
 }
 
 impl<'a> Validator<'_, 'a> {
@@ -299,7 +312,7 @@ impl<'a> Validator<'_, 'a> {
         }
         let (raw, size) = self.doc.raw(pos).ok_or(malformed.clone())?;
         // An extended value is its payload, which follows it, and one value more.
-        let (at, raw, size, extended) = match raw {
+        let (at, raw, size, kind) = match raw {
             Raw::Ext(kind) if kind > ext::MAX => {
                 return Err(DecodeError::UnknownExt { pos, kind });
             }
@@ -307,18 +320,22 @@ impl<'a> Validator<'_, 'a> {
                 None | Some((Raw::Ext(_) | Raw::Pointer, _)) => {
                     return Err(DecodeError::BadPayload { pos, kind });
                 }
-                Some((payload, payload_size)) => (pos + 2, payload, payload_size + 2, 1),
+                Some((payload, payload_size)) => (pos + 2, payload, payload_size + 2, Some(kind)),
             },
-            _ => (pos, raw, size, 0),
+            _ => (pos, raw, size, None),
         };
         if size > limit {
             return Err(malformed);
         }
-        match raw {
-            Raw::Pointer => Err(malformed),
+        let extended = u64::from(kind.is_some());
+        let (values, height) = match raw {
+            Raw::Pointer => return Err(malformed),
+            // Undefined is how a dictionary deletes an entry of the one it inherits from,
+            // which `collection` lets through; anywhere else no value can be made of it.
+            Raw::Undefined => return Err(DecodeError::Undefined { pos }),
             Raw::Str(bytes) => {
                 self.utf8(at, bytes, shared)?;
-                Ok((1 + extended, 0))
+                (1 + extended, 0)
             }
             Raw::Coll { dict, wide, count, first } => {
                 // A collection many pointers lead to is checked once: what it expands to
@@ -334,10 +351,16 @@ impl<'a> Validator<'_, 'a> {
                 if shared {
                     self.seen.insert(pos, (values + extended, height));
                 }
-                Ok((values + extended, height))
+                (values + extended, height)
             }
-            _ => Ok((1 + extended, 0)),
+            _ => (1 + extended, 0),
+        };
+        // The values inside the payload are checked by now, so what is left to ask is
+        // whether the payload has the form of its kind.
+        if let Some(kind) = kind {
+            crate::codec::check_payload(kind, self.doc.value_at(at), pos)?;
         }
+        Ok((values, height))
     }
 
     fn collection(
@@ -399,6 +422,11 @@ impl<'a> Validator<'_, 'a> {
                 values += 1;
                 continue;
             }
+            // An entry deleted from the dictionary inherited from.
+            if inherits && i > 1 && matches!(self.doc.raw(target), Some((Raw::Undefined, _))) {
+                values += 1;
+                continue;
+            }
             let (inner, inner_height) = self.value(target, depth + 1, by_pointer, limit)?;
             // The entry a dictionary inherits through has to lead to a dictionary.
             if inherits
@@ -410,7 +438,18 @@ impl<'a> Validator<'_, 'a> {
             values = values.saturating_add(inner);
             height = height.max(inner_height + 1);
         }
-        if values > MAX_VALUES {
+        if inherits {
+            // What the dictionary inherited from holds under a key of this one is hidden:
+            // it was counted with that dictionary, and no reader comes to it.
+            let own = DictRef { doc: *self.doc, first, count, wide };
+            for entry in 1..count {
+                if let Some(hidden) = own.hidden(entry) {
+                    let (inner, _) = self.value(hidden.pos, depth + 1, true, usize::MAX)?;
+                    values = values.saturating_sub(1 + inner);
+                }
+            }
+        }
+        if values > self.most {
             return Err(DecodeError::TooManyValues);
         }
         Ok((values, height))
@@ -647,8 +686,14 @@ impl<'a> DictRef<'a> {
         self.count > 0 && self.key_at(0) == Some(Key::Int(PARENT_KEY))
     }
 
+    /// The dictionary this one inherits from. It lies before this one, as what a document
+    /// is appended to does: in bytes nobody checked a pointer may lead from a dictionary
+    /// to itself, and the dictionaries inherited from would then never end.
     fn parent(&self) -> Option<DictRef<'a>> {
-        if self.inherits() { self.value_at(0)?.as_dict() } else { None }
+        if !self.inherits() {
+            return None;
+        }
+        self.value_at(0)?.as_dict().filter(|parent| parent.first < self.first)
     }
 
     /// The entry of `key` among the entries of this dictionary alone, by binary search.
@@ -667,6 +712,12 @@ impl<'a> DictRef<'a> {
 
     fn find(&self, key: Key<'_>) -> Option<ValueRef<'a>> {
         self.value_at(self.find_entry(key)?)
+    }
+
+    /// What the dictionaries inherited from give for the key of an entry of this one: the
+    /// value that entry hides.
+    fn hidden(&self, entry: usize) -> Option<ValueRef<'a>> {
+        self.parent()?.get(self.entry(entry)?.0)
     }
 
     /// How many dictionaries this one inherits through.

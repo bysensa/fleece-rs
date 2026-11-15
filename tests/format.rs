@@ -307,9 +307,9 @@ fn the_deepest_documents_are_walked_without_running_out_of_stack() {
     thread.join().unwrap();
 }
 
-#[test]
-fn a_small_document_cannot_stand_for_an_endless_one() {
-    // Each array holds the one before it 16 times: 16^10 values in 400 bytes.
+/// An array of one string, inside `levels` arrays that each hold the one before it `width`
+/// times, by pointers to the same bytes.
+fn held_many_times(levels: usize, width: u8) -> Vec<u8> {
     let mut encoder = Encoder::new();
     encoder.begin_array().unwrap();
     encoder.write_str("some string").unwrap();
@@ -317,10 +317,10 @@ fn a_small_document_cannot_stand_for_an_endless_one() {
     let mut bytes = encoder.finish().unwrap();
     bytes.truncate(bytes.len() - 2);
     let mut last = bytes.len() - 4;
-    for _ in 0..10 {
+    for _ in 0..levels {
         let at = bytes.len();
-        bytes.extend_from_slice(&[0x60, 16]);
-        for slot in 0..16 {
+        bytes.extend_from_slice(&[0x60, width]);
+        for slot in 0..usize::from(width) {
             let units = (at + 2 + 2 * slot - last) / 2;
             bytes.extend_from_slice(&(0x8000 | units as u16).to_be_bytes());
         }
@@ -328,5 +328,89 @@ fn a_small_document_cannot_stand_for_an_endless_one() {
     }
     let units = (bytes.len() - last) / 2;
     bytes.extend_from_slice(&(0x8000 | units as u16).to_be_bytes());
-    assert_eq!(Doc::new(&bytes).unwrap_err(), DecodeError::TooManyValues);
+    bytes
+}
+
+#[test]
+fn a_small_document_cannot_stand_for_an_endless_one() {
+    // 16^10 values in 400 bytes.
+    assert_eq!(Doc::new(&held_many_times(10, 16)).unwrap_err(), DecodeError::TooManyValues);
+    // A million values in 200 bytes, and 2^20 of them in 150: few enough for a limit that
+    // does not ask how long the document is, and a gigabyte once they are decoded.
+    assert_eq!(Doc::new(&held_many_times(5, 16)).unwrap_err(), DecodeError::TooManyValues);
+    assert_eq!(Doc::new(&held_many_times(20, 2)).unwrap_err(), DecodeError::TooManyValues);
+    // An array held twice is within what the bytes of the document have room for.
+    let twice = held_many_times(1, 2);
+    let inner = Value::Array(vec!["some string".into()]);
+    assert_eq!(decode(&twice).unwrap(), Value::Array(vec![inner.clone(), inner]));
+}
+
+#[test]
+fn bytes_nobody_checked_end_every_read() {
+    // A dictionary whose pointer to the one it inherits from leads to itself.
+    let bytes = hex("70 01 08 00 80 02 80 03");
+    assert_eq!(Doc::new(&bytes).unwrap_err(), DecodeError::TooDeep);
+    let root = Doc::trusted(&bytes).root();
+    let dict = root.as_dict().unwrap();
+    assert!(dict.get("name").is_none());
+    assert_eq!((dict.len(), dict.iter().count()), (0, 0));
+    assert_eq!(Value::from_ref(root), Ok(Value::Object(Object::new())));
+
+    // Arrays that hold one another many times make no more values than the bytes have
+    // room for, also when no check stood in the way.
+    let endless = held_many_times(40, 2);
+    let decoded = Value::from_ref(Doc::trusted(&endless).root());
+    assert_eq!(decoded, Err(DecodeError::TooManyValues));
+}
+
+#[test]
+fn what_a_dictionary_hides_is_not_counted_against_the_document() {
+    // A dictionary as full of values as its bytes have room for: every key and every value
+    // lies in its slot. Each change is appended as a dictionary that inherits, the old
+    // dictionaries staying in the bytes below it.
+    let keys = || ('0'..='z').map(String::from);
+    let inner = |first: i64| {
+        let fields = keys().enumerate().map(|(i, key)| (key, Value::from(i as i64 + first)));
+        Value::Object(fields.collect())
+    };
+    // Enough fields around it that a change of one is appended as a dictionary that
+    // inherits the rest, so the dictionary before the change stays in reach of the check.
+    let outer = |first: i64| {
+        let around = ('a'..='h').map(|key| (key.to_string(), Value::from(1)));
+        Value::Object(around.chain([("i".to_owned(), inner(first))]).collect())
+    };
+    let mut bytes = encode(&outer(0)).unwrap();
+    for change in 1..40 {
+        // One value changes on odd turns, every value on even ones.
+        let mut new = outer(change / 2 * 100);
+        if let (1, Value::Object(fields)) = (change % 2, &mut new) {
+            let Some(Value::Object(inner)) = fields.get_mut("i") else { unreachable!() };
+            inner.insert("0".to_owned(), Value::from(change));
+        }
+        let delta = fleece::delta::append_delta(&bytes, &new).unwrap();
+        bytes.extend_from_slice(&delta);
+        assert_eq!(decode(&bytes).unwrap(), new, "after {change} changes");
+    }
+}
+
+#[test]
+fn a_document_that_passes_the_check_is_one_decode_takes() {
+    // An i8 of 1784.
+    let wide = hex("31 01 06 f8 80 02");
+    assert_eq!(Doc::new(&wide).unwrap_err(), DecodeError::BadPayload { pos: 0, kind: 1 });
+    // A time of day past the end of the day, a UUID of three bytes, a table that is a number.
+    for (bytes, kind) in [
+        ("31 0f 1f ff ff ff ff ff ff ff ff 00 80 06", 15),
+        ("31 0d 53 01 02 03 80 03", 13),
+        ("31 12 00 07 80 02", 18),
+    ] {
+        let error = Doc::new(&hex(bytes)).unwrap_err();
+        assert_eq!(error, DecodeError::BadPayload { pos: 0, kind }, "{bytes}");
+    }
+    // Undefined, which only deletes an entry of a dictionary inherited from.
+    assert_eq!(Doc::new(&hex("3c 00")).unwrap_err(), DecodeError::Undefined { pos: 0 });
+    let in_array = hex("60 01 3c 00 80 02");
+    assert_eq!(Doc::new(&in_array).unwrap_err(), DecodeError::Undefined { pos: 2 });
+    // Unchecked, such bytes still read, as what they are.
+    assert!(matches!(Doc::trusted(&hex("3c 00")).root().item(), Item::Undefined));
 }

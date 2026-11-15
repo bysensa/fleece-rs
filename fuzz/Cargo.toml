@@ -1,0 +1,52 @@
+# Fuzz targets, run by `cargo fuzz` (libFuzzer) on a nightly toolchain. See README.md here.
+[package]
+name = "fleece-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# A crate of its own, outside the one it checks.
+[workspace]
+
+[dependencies]
+fleece = { path = "..", features = ["serde", "geo"] }
+libfuzzer-sys = "0.4"
+serde_json = "1"
+
+[[bin]]
+name = "read"
+path = "fuzz_targets/read.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "delta"
+path = "fuzz_targets/delta.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "update"
+path = "fuzz_targets/update.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "json"
+path = "fuzz_targets/json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "shared"
+path = "fuzz_targets/shared.rs"
+test = false
+doc = false
+bench = false

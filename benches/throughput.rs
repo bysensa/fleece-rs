@@ -209,6 +209,24 @@ fn main() {
         black_box(&embedding).iter().zip(black_box(&query)).map(|(a, b)| a * b).sum::<f32>()
     });
 
+    #[cfg(feature = "geo")]
+    {
+        println!();
+        let mut ring: Vec<Point> =
+            (0..10_000).map(|i| Point { x: f64::from(i).cos(), y: f64::from(i).sin() }).collect();
+        ring.push(ring[0]);
+        let outline = Geometry::Polygon(fleece::Polygon { exterior: ring, interiors: vec![] });
+        let stored = encode(&Value::Geometry(outline)).unwrap();
+        let geometry = || Doc::trusted(&stored).root().as_geometry().unwrap();
+        measure("polygon of 10 000 points: read", stored.len(), geometry);
+        measure("polygon: read, given to geo-types", stored.len(), || {
+            geo_types::Geometry::from(geometry())
+        });
+        measure("polygon: read, copied to geo-types", stored.len(), || {
+            geo_types::Geometry::from(&geometry())
+        });
+    }
+
     println!();
     for depth in [25, 50, 100] {
         let (old, new) = (nested(depth, 1), nested(depth, 2));

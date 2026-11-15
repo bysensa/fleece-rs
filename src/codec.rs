@@ -1,5 +1,6 @@
 //! [`Value`] to Fleece and back.
 
+use std::cell::Cell;
 use std::ops::Bound;
 
 use crate::encoder::Encoder;
@@ -289,12 +290,29 @@ impl Encoder<'_> {
 }
 
 /// Reads the payload of one extended value, every mismatch being the same error.
-struct Payload {
+struct Payload<'b> {
     error: DecodeError,
     depth: usize,
+    /// How many values may still be made; see [`values_of`].
+    left: &'b Cell<usize>,
 }
 
-impl Payload {
+/// How many values a decode may make of a document: one for every two of its bytes, which
+/// is what [`Doc::validate`] holds a document to. A document that passed the check stays
+/// under it. Bytes that were not checked may hold collections that many pointers lead to,
+/// one inside the other, and stand for more values than any memory has room for; of those
+/// a decode makes this many and then says so.
+fn values_of(doc: Doc<'_>) -> Cell<usize> {
+    Cell::new(doc.end() / 2)
+}
+
+/// Takes one value from those a decode may still make.
+fn spend(left: &Cell<usize>) -> Result<(), DecodeError> {
+    left.set(left.get().checked_sub(1).ok_or(DecodeError::TooManyValues)?);
+    Ok(())
+}
+
+impl Payload<'_> {
     fn int(&self, value: ValueRef<'_>) -> Result<i64, DecodeError> {
         value.as_i64().ok_or(self.error.clone())
     }
@@ -365,6 +383,8 @@ impl Payload {
     }
 
     fn geometry(&self, value: ValueRef<'_>) -> Result<Geometry, DecodeError> {
+        // A collection holds geometries, which pointers may lead to many times.
+        spend(self.left)?;
         let [kind, shape] = self.items(value)?;
         Ok(match self.int(kind)? {
             GEOMETRY_POINT => match self.points(shape)?[..] {
@@ -382,7 +402,8 @@ impl Payload {
                 if self.depth >= MAX_DEPTH {
                     return Err(DecodeError::TooDeep);
                 }
-                let inner = Payload { error: self.error.clone(), depth: self.depth + 2 };
+                let (error, depth) = (self.error.clone(), self.depth + 2);
+                let inner = Payload { error, depth, left: self.left };
                 let geometries = self.list(shape)?.map(|geometry| match geometry.item() {
                     Item::Ext(ext::GEOMETRY, Some(payload)) => inner.geometry(payload),
                     _ => Err(self.error.clone()),
@@ -393,28 +414,78 @@ impl Payload {
         })
     }
 
-    fn range(&self, value: ValueRef<'_>) -> Result<Range, DecodeError> {
+    /// Whether a geometry has the form [`Payload::geometry`] reads, without reading it. The
+    /// geometries inside a collection are values of their own and asked for theirs.
+    fn geometry_fits(&self, value: ValueRef<'_>) -> bool {
+        let points = |value: ValueRef<'_>| value.as_data().is_some_and(|data| data.len() % 16 == 0);
+        let rings =
+            |value: ValueRef<'_>| value.as_array().is_some_and(|all| all.iter().all(points));
+        let polygon = |value: ValueRef<'_>| {
+            rings(value) && value.as_array().is_some_and(|all| !all.is_empty())
+        };
+        let Ok([kind, shape]) = self.items(value) else { return false };
+        match kind.as_i64() {
+            Some(GEOMETRY_POINT) => shape.as_data().is_some_and(|data| data.len() == 16),
+            Some(GEOMETRY_LINE | GEOMETRY_MULTI_POINT) => points(shape),
+            Some(GEOMETRY_POLYGON) => polygon(shape),
+            Some(GEOMETRY_MULTI_LINE) => rings(shape),
+            Some(GEOMETRY_MULTI_POLYGON) => {
+                shape.as_array().is_some_and(|all| all.iter().all(polygon))
+            }
+            Some(GEOMETRY_COLLECTION) => shape.as_array().is_some_and(|all| {
+                all.iter().all(|inner| matches!(inner.item(), Item::Ext(ext::GEOMETRY, Some(_))))
+            }),
+            _ => false,
+        }
+    }
+
+    /// The two bounds of a range as they are written: what kind of bound each is, and the
+    /// value of one that has a value.
+    fn bounds<'a>(&self, value: ValueRef<'a>) -> Result<[(i64, ValueRef<'a>); 2], DecodeError> {
         let [flags, start, end] = self.items(value)?;
         let flags = self.int(flags)?;
-        let bound = |flag: i64, value: ValueRef<'_>| {
-            Ok(match flag {
-                BOUND_UNBOUNDED if value.is_null() => Bound::Unbounded,
-                BOUND_INCLUDED => Bound::Included(decode_value(value, self.depth + 1)?),
-                BOUND_EXCLUDED => Bound::Excluded(decode_value(value, self.depth + 1)?),
-                _ => return Err(self.error.clone()),
-            })
-        };
         if !(0..16).contains(&flags) {
             return Err(self.error.clone());
         }
-        Ok(Range { start: bound(flags & 3, start)?, end: bound(flags >> 2, end)? })
+        let bounds = [(flags & 3, start), (flags >> 2, end)];
+        let fits = |(kind, value): &(i64, ValueRef<'_>)| match *kind {
+            BOUND_UNBOUNDED => value.is_null(),
+            BOUND_INCLUDED | BOUND_EXCLUDED => true,
+            _ => false,
+        };
+        if bounds.iter().all(fits) { Ok(bounds) } else { Err(self.error.clone()) }
+    }
+
+    fn range(&self, value: ValueRef<'_>) -> Result<Range, DecodeError> {
+        let bound = |(kind, value): (i64, ValueRef<'_>)| {
+            Ok(match kind {
+                BOUND_UNBOUNDED => Bound::Unbounded,
+                BOUND_INCLUDED => Bound::Included(decode_value(value, self.depth + 1, self.left)?),
+                _ => Bound::Excluded(decode_value(value, self.depth + 1, self.left)?),
+            })
+        };
+        let [start, end] = self.bounds(value)?;
+        Ok(Range { start: bound(start)?, end: bound(end)? })
     }
 
     fn record(&self, payload: ValueRef<'_>) -> Result<Value, DecodeError> {
         let [table, key] = self.items(payload)?;
-        let key = decode_value(key, self.depth + 1)?;
+        let key = decode_value(key, self.depth + 1, self.left)?;
         let key = RecordIdKey::try_from(key).map_err(|_| self.error.clone())?;
         Ok(Value::RecordId(RecordId { table: self.string(table)?, key }))
+    }
+
+    /// Whether a value is of a type the key of a record has, as `RecordIdKey::try_from`
+    /// takes them: a range of keys is a key.
+    fn key_fits(&self, key: ValueRef<'_>) -> bool {
+        match key.item() {
+            Item::Int(_) | Item::String(_) | Item::Array(_) | Item::Dict(_) => true,
+            Item::Ext(ext::UUID, Some(_)) => true,
+            Item::Ext(ext::RANGE, Some(range)) => self.bounds(range).is_ok_and(|bounds| {
+                bounds.iter().all(|(kind, value)| *kind == BOUND_UNBOUNDED || self.key_fits(*value))
+            }),
+            _ => false,
+        }
     }
 
     /// An extended value that holds no other value. The kinds that do are read by
@@ -487,12 +558,17 @@ impl Payload {
     }
 }
 
-fn decode_value(value: ValueRef<'_>, depth: usize) -> Result<Value, DecodeError> {
+fn decode_value(
+    value: ValueRef<'_>,
+    depth: usize,
+    left: &Cell<usize>,
+) -> Result<Value, DecodeError> {
     let pos = value.position();
     // Ranges and record keys nest without a collection of their own in between.
     if depth > MAX_DEPTH {
         return Err(DecodeError::TooDeep);
     }
+    spend(left)?;
     Ok(match value.item() {
         Item::Null => Value::Null,
         Item::Bool(v) => Value::Bool(v),
@@ -502,10 +578,13 @@ fn decode_value(value: ValueRef<'_>, depth: usize) -> Result<Value, DecodeError>
         Item::Float64(v) => Value::Number(Number::Float(v)),
         Item::String(v) => Value::String(v.to_owned()),
         Item::Data(v) => Value::Bytes(v.to_vec()),
-        Item::Array(array) => Value::Array(decode_items(array, depth)?),
-        Item::Dict(dict) => Value::Object(decode_fields(dict, depth)?),
+        Item::Array(array) => Value::Array(decode_items(array, depth, left)?),
+        Item::Dict(dict) => Value::Object(decode_fields(dict, depth, left)?),
         Item::Ext(ext::NONE, _) => Value::None,
-        Item::Ext(kind, Some(payload)) => return decode_extended(kind, payload, pos, depth),
+        Item::Ext(kind, Some(payload)) => {
+            let read = Payload { error: DecodeError::BadPayload { pos, kind }, depth, left };
+            return decode_extended(kind, payload, read);
+        }
         Item::Ext(..) | Item::Invalid => return Err(DecodeError::Malformed { pos }),
         Item::Undefined => return Err(DecodeError::Undefined { pos }),
     })
@@ -513,24 +592,34 @@ fn decode_value(value: ValueRef<'_>, depth: usize) -> Result<Value, DecodeError>
 
 /// The items of an array, straight into a vector of their number: collecting through a
 /// `Result` would first gather them in a vector that grows as it goes.
-fn decode_items(array: ArrayRef<'_>, depth: usize) -> Result<Vec<Value>, DecodeError> {
+fn decode_items(
+    array: ArrayRef<'_>,
+    depth: usize,
+    left: &Cell<usize>,
+) -> Result<Vec<Value>, DecodeError> {
     if depth >= MAX_DEPTH {
         return Err(DecodeError::TooDeep);
     }
-    let mut items = Vec::with_capacity(array.len());
+    // No more room than for the values that may still be made: the count is what the
+    // bytes say, which no one may have checked.
+    let mut items = Vec::with_capacity(array.len().min(left.get()));
     for item in array.iter() {
-        items.push(decode_value(item, depth + 1)?);
+        items.push(decode_value(item, depth + 1, left)?);
     }
     Ok(items)
 }
 
-fn decode_fields(dict: DictRef<'_>, depth: usize) -> Result<Object, DecodeError> {
+fn decode_fields(
+    dict: DictRef<'_>,
+    depth: usize,
+    left: &Cell<usize>,
+) -> Result<Object, DecodeError> {
     if depth >= MAX_DEPTH {
         return Err(DecodeError::TooDeep);
     }
     let mut fields = Object::new();
     for (key, value) in dict.iter() {
-        fields.insert(key.to_owned(), decode_value(value, depth + 1)?);
+        fields.insert(key.to_owned(), decode_value(value, depth + 1, left)?);
     }
     Ok(fields)
 }
@@ -540,13 +629,11 @@ fn decode_fields(dict: DictRef<'_>, depth: usize) -> Result<Object, DecodeError>
 fn decode_extended(
     kind: u8,
     payload: ValueRef<'_>,
-    pos: usize,
-    depth: usize,
+    read: Payload<'_>,
 ) -> Result<Value, DecodeError> {
-    let read = Payload { error: DecodeError::BadPayload { pos, kind }, depth };
     match kind {
         ext::SET => match payload.as_array() {
-            Some(array) => Ok(Value::Set(decode_items(array, depth)?)),
+            Some(array) => Ok(Value::Set(decode_items(array, read.depth, read.left)?)),
             None => Err(read.error),
         },
         ext::RANGE => Ok(Value::Range(Box::new(read.range(payload)?))),
@@ -556,9 +643,56 @@ fn decode_extended(
     }
 }
 
+/// Whether the payload of an extended value at `pos` has the form of its kind, for the
+/// check of a document: what [`decode_extended`] refuses, this refuses. The values inside
+/// the payload are not asked: the check walks them itself, and has walked them by the time
+/// it calls this, which is what keeps the ranges in the key of a record within the size of
+/// the document. Kept out of the function that calls it, which is called once for every
+/// level of a deep document and has to stay small on the stack.
+#[inline(never)]
+pub(crate) fn check_payload(
+    kind: u8,
+    payload: ValueRef<'_>,
+    pos: usize,
+) -> Result<(), DecodeError> {
+    let left = values_of(payload.doc());
+    let read = Payload { error: DecodeError::BadPayload { pos, kind }, depth: 0, left: &left };
+    let fits = match kind {
+        ext::SET => payload.as_array().is_some(),
+        ext::RANGE => read.bounds(payload).is_ok(),
+        ext::RECORD_ID => read
+            .items(payload)
+            .is_ok_and(|[table, key]| table.as_str().is_some() && read.key_fits(key)),
+        ext::GEOMETRY => read.geometry_fits(payload),
+        // The kinds whose values are long, asked without a copy of the value.
+        ext::TABLE | ext::REGEX => payload.as_str().is_some(),
+        ext::VECTOR => payload.as_data().and_then(VectorRef::parse).is_some(),
+        _ => read.leaf(kind, payload).is_ok(),
+    };
+    if fits { Ok(()) } else { Err(read.error) }
+}
+
+impl ValueRef<'_> {
+    /// The value as a geometry, when it is one: only this value is decoded, not the
+    /// document around it.
+    pub fn as_geometry(&self) -> Option<Geometry> {
+        match self.item() {
+            Item::Ext(ext::GEOMETRY, Some(payload)) => {
+                let error = DecodeError::Malformed { pos: self.position() };
+                let left = values_of(self.doc());
+                Payload { error, depth: 0, left: &left }.geometry(payload).ok()
+            }
+            _ => None,
+        }
+    }
+}
+
 impl Value {
-    /// The owned copy of a value of a document.
+    /// The owned copy of a value of a document. It holds no more values than the document
+    /// has room for, one for every two of its bytes, whatever the bytes are: past that the
+    /// answer is [`DecodeError::TooManyValues`], which a document that passed
+    /// [`Doc::validate`] never gives.
     pub fn from_ref(value: ValueRef<'_>) -> Result<Value, DecodeError> {
-        decode_value(value, 0)
+        decode_value(value, 0, &values_of(value.doc()))
     }
 }

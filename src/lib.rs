@@ -18,6 +18,8 @@
 //!   one, without decoding it;
 //! - [`Vector`] and [`VectorRef`]: embeddings stored tightly and compared with a query
 //!   where they lie;
+//! - [`geo`](mod@crate::geo) (feature `geo`): geometries to and from the types the `geo`
+//!   crates compute on;
 //! - [`Kind`]: the kinds of SurrealDB, and whether a value in a document is of one;
 //! - [`key`]: values as keys of an ordered store, for indexes;
 //! - [`serde`](mod@crate::serde) (feature `serde`): the types of an application to documents and back;
@@ -113,6 +115,8 @@ mod dump;
 mod encoder;
 mod error;
 mod format;
+#[cfg(feature = "geo")]
+pub mod geo;
 mod hash;
 #[cfg(feature = "json")]
 pub mod json;

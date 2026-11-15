@@ -12,14 +12,22 @@ default = ["json"]
 json = ["dep:serde_json"]
 # The types of an application to documents and back, without a `Value` in between.
 serde = ["dep:serde"]
+# Geometries to and from the types of `geo-types`, which the algorithms of `geo` work on.
+geo = ["dep:geo-types"]
 
 [dependencies]
+geo-types = { version = "0.7", optional = true }
 serde = { version = "1", optional = true }
 # float_roundtrip: a float read from JSON text is the float that was written.
 serde_json = { version = "1", optional = true, features = ["float_roundtrip"] }
 
 [[example]]
 name = "fleece"
+required-features = ["json"]
+
+# The inputs the fuzz targets of `fuzz/` start from.
+[[example]]
+name = "fuzz_seeds"
 required-features = ["json"]
 
 [[bench]]
@@ -29,6 +37,8 @@ required-features = ["json"]
 
 [dev-dependencies]
 proptest = "1"
+# The algorithms a converted geometry is given to in the tests.
+geo = "0.33"
 # The crates SurrealDB holds these types with: the layouts here are checked against them.
 geo-types = "0.7"
 half = "2"
