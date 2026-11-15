@@ -55,6 +55,7 @@ mod dump;
 mod encoder;
 mod error;
 mod format;
+mod hash;
 #[cfg(feature = "json")]
 pub mod json;
 mod keypath;

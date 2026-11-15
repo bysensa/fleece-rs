@@ -312,8 +312,12 @@ impl Payload {
         value: ValueRef<'a>,
     ) -> Result<[ValueRef<'a>; N], DecodeError> {
         let array = value.as_array().filter(|array| array.len() == N);
-        let items: Vec<_> = array.ok_or(self.error.clone())?.iter().collect();
-        items.try_into().map_err(|_| self.error.clone())
+        let array = array.ok_or(self.error.clone())?;
+        let mut items = [value; N];
+        for (index, item) in items.iter_mut().enumerate() {
+            *item = array.get(index).ok_or(self.error.clone())?;
+        }
+        Ok(items)
     }
 
     /// The items of an array of any length.
@@ -492,14 +496,22 @@ fn decode_value(value: ValueRef<'_>, depth: usize) -> Result<Value, DecodeError>
         Item::String(v) => Value::String(v.to_owned()),
         Item::Data(v) => Value::Bytes(v.to_vec()),
         Item::Array(_) | Item::Dict(_) if depth >= MAX_DEPTH => return Err(DecodeError::TooDeep),
-        Item::Array(array) => Value::Array(
-            array.iter().map(|item| decode_value(item, depth + 1)).collect::<Result<_, _>>()?,
-        ),
+        Item::Array(array) => {
+            // The items go straight into a vector of their number, and the fields below
+            // straight into the map: collecting through a `Result` would first gather them
+            // in a vector that grows as it goes.
+            let mut items = Vec::with_capacity(array.len());
+            for item in array.iter() {
+                items.push(decode_value(item, depth + 1)?);
+            }
+            Value::Array(items)
+        }
         Item::Dict(dict) => {
-            let fields = dict.iter().map(|(key, value)| {
-                decode_value(value, depth + 1).map(|value| (key.to_owned(), value))
-            });
-            Value::Object(fields.collect::<Result<_, _>>()?)
+            let mut fields = Object::new();
+            for (key, value) in dict.iter() {
+                fields.insert(key.to_owned(), decode_value(value, depth + 1)?);
+            }
+            Value::Object(fields)
         }
         Item::Ext(ext::NONE, _) => Value::None,
         Item::Ext(kind, Some(payload)) => {

@@ -2,11 +2,10 @@
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::collections::hash_map::RandomState;
-use std::hash::{BuildHasher, Hasher};
 
 use crate::error::EncodeError;
 use crate::format::*;
+use crate::hash::Seeds;
 use crate::reader::{Item, ValueRef};
 use crate::shared_keys::SharedKeys;
 
@@ -56,56 +55,6 @@ impl Shared<'_> {
             Self::Growing(shared) => shared.decode(number),
             Self::Fixed(shared) => shared.decode(number),
         }
-    }
-}
-
-/// The hashing of the table of short strings. A string of up to 15 bytes and its length
-/// are one 128-bit number, which is hashed by one multiplication with two numbers picked
-/// at random for each encoder, so that strings chosen by someone else cannot be made to
-/// fall into one bucket.
-#[derive(Clone, Copy)]
-struct Seeds(u64, u64);
-
-impl Seeds {
-    fn random() -> Self {
-        let state = RandomState::new();
-        Self(state.hash_one(0u8), state.hash_one(1u8))
-    }
-
-    fn fold(self, low: u64, high: u64) -> u64 {
-        let product = u128::from(low ^ self.0) * u128::from(high ^ self.1);
-        product as u64 ^ (product >> 64) as u64
-    }
-}
-
-impl BuildHasher for Seeds {
-    type Hasher = Fold;
-
-    fn build_hasher(&self) -> Fold {
-        Fold { seeds: *self, hash: 0 }
-    }
-}
-
-struct Fold {
-    seeds: Seeds,
-    hash: u64,
-}
-
-impl Hasher for Fold {
-    fn write(&mut self, bytes: &[u8]) {
-        for chunk in bytes.chunks(8) {
-            let mut word = [0; 8];
-            word[..chunk.len()].copy_from_slice(chunk);
-            self.hash = self.seeds.fold(u64::from_le_bytes(word), self.hash);
-        }
-    }
-
-    fn write_u128(&mut self, key: u128) {
-        self.hash = self.seeds.fold(key as u64, (key >> 64) as u64 ^ self.hash);
-    }
-
-    fn finish(&self) -> u64 {
-        self.hash
     }
 }
 

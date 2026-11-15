@@ -5,6 +5,7 @@ use std::fmt::{self, Debug, Formatter};
 
 use crate::error::DecodeError;
 use crate::format::*;
+use crate::hash::Seeds;
 use crate::shared_keys::SharedKeys;
 
 /// The most values a document may expand to once every pointer is followed. Values shared by
@@ -226,25 +227,49 @@ impl<'a> Doc<'a> {
             return Err(DecodeError::Truncated);
         }
         let end = self.end() - 2;
-        let mut validator = Validator { doc: self, seen: HashMap::new() };
-        let root = if self.is_pointer(end) {
-            let target = validator.pointer(end, false, true)?;
-            if self.is_pointer(target) { validator.pointer(target, true, false)? } else { target }
-        } else {
-            end
+        let mut validator = Validator {
+            doc: self,
+            // Room for a collection in every 64 bytes, which few documents exceed.
+            seen: HashMap::with_capacity_and_hasher(self.end() / 64, Seeds::random()),
+            strings: vec![0; self.end() / 128 + 1],
         };
-        validator.value(root, 0, true).map(|_| ())
+        let (root, limit) = if self.is_pointer(end) {
+            let target = validator.pointer(end, false, true)?;
+            let root = match self.is_pointer(target) {
+                true => validator.pointer(target, true, false)?,
+                false => target,
+            };
+            (root, usize::MAX)
+        } else {
+            (end, 2)
+        };
+        validator.value(root, 0, true, limit).map(|_| ())
     }
 }
 
 struct Validator<'d, 'a> {
     doc: &'d Doc<'a>,
-    /// The values reached by a pointer and already checked: how many values each expands to
-    /// and how deep the collections in it nest.
-    seen: HashMap<usize, (u64, usize)>,
+    /// The collections reached by a pointer and already checked: how many values each
+    /// expands to and how deep the collections in it nest.
+    seen: HashMap<usize, (u64, usize), Seeds>,
+    /// A bit for each even position: the string a pointer leads to there is UTF-8.
+    strings: Vec<u64>,
 }
 
-impl Validator<'_, '_> {
+impl<'a> Validator<'_, 'a> {
+    /// Checks that a string is UTF-8, once for a string that many pointers lead to.
+    fn utf8(&mut self, pos: usize, bytes: &[u8], shared: bool) -> Result<(), DecodeError> {
+        let (word, bit) = (pos / 128, 1 << (pos / 2 % 64));
+        if shared && self.strings.get(word).is_some_and(|bits| bits & bit != 0) {
+            return Ok(());
+        }
+        std::str::from_utf8(bytes).map_err(|_| DecodeError::InvalidUtf8 { pos })?;
+        if shared && let Some(bits) = self.strings.get_mut(word) {
+            *bits |= bit;
+        }
+        Ok(())
+    }
+
     fn pointer(&self, addr: usize, wide: bool, to_pointer: bool) -> Result<usize, DecodeError> {
         let bad = DecodeError::BadPointer { pos: addr };
         let (target, external) = self.doc.pointer(addr, wide).ok_or(bad.clone())?;
@@ -258,30 +283,23 @@ impl Validator<'_, '_> {
         Ok(target)
     }
 
-    /// Checks the value at `pos`, `depth` collections down. `shared` says a pointer led here,
-    /// so the result is worth remembering.
+    /// Checks the value at `pos`, `depth` collections down, and gives how many values it
+    /// expands to and how deep the collections in it nest. `shared` says a pointer led
+    /// here, so the value may be met again; `limit` is the size of the slot it lies in.
     fn value(
         &mut self,
         pos: usize,
         depth: usize,
         shared: bool,
+        limit: usize,
     ) -> Result<(u64, usize), DecodeError> {
         let malformed = DecodeError::Malformed { pos };
         if pos & 1 == 1 {
             return Err(malformed);
         }
-        if shared && let Some(&(values, height)) = self.seen.get(&pos) {
-            if depth + height > MAX_DEPTH {
-                return Err(DecodeError::TooDeep);
-            }
-            return Ok((values, height));
-        }
-        let result = match self.doc.raw(pos).ok_or(malformed.clone())?.0 {
-            Raw::Pointer => return Err(malformed),
-            Raw::Str(bytes) => {
-                std::str::from_utf8(bytes).map_err(|_| DecodeError::InvalidUtf8 { pos })?;
-                (1, 0)
-            }
+        let (raw, size) = self.doc.raw(pos).ok_or(malformed.clone())?;
+        // An extended value is its payload, which follows it, and one value more.
+        let (at, raw, size, extended) = match raw {
             Raw::Ext(kind) if kind > ext::MAX => {
                 return Err(DecodeError::UnknownExt { pos, kind });
             }
@@ -289,20 +307,37 @@ impl Validator<'_, '_> {
                 None | Some((Raw::Ext(_) | Raw::Pointer, _)) => {
                     return Err(DecodeError::BadPayload { pos, kind });
                 }
-                Some(_) => {
-                    let (values, height) = self.value(pos + 2, depth, false)?;
-                    (values + 1, height)
-                }
+                Some((payload, payload_size)) => (pos + 2, payload, payload_size + 2, 1),
             },
-            Raw::Coll { dict, wide, count, first } => {
-                self.collection(pos, depth, dict, wide, count, first)?
-            }
-            _ => (1, 0),
+            _ => (pos, raw, size, 0),
         };
-        if shared {
-            self.seen.insert(pos, result);
+        if size > limit {
+            return Err(malformed);
         }
-        Ok(result)
+        match raw {
+            Raw::Pointer => Err(malformed),
+            Raw::Str(bytes) => {
+                self.utf8(at, bytes, shared)?;
+                Ok((1 + extended, 0))
+            }
+            Raw::Coll { dict, wide, count, first } => {
+                // A collection many pointers lead to is checked once: what it expands to
+                // is remembered, which also keeps the work in step with the size of the
+                // document whatever its pointers do.
+                if shared && let Some(&(values, height)) = self.seen.get(&pos) {
+                    if depth + height > MAX_DEPTH {
+                        return Err(DecodeError::TooDeep);
+                    }
+                    return Ok((values, height));
+                }
+                let (values, height) = self.collection(at, depth, dict, wide, count, first)?;
+                if shared {
+                    self.seen.insert(pos, (values + extended, height));
+                }
+                Ok((values + extended, height))
+            }
+            _ => Ok((1 + extended, 0)),
+        }
     }
 
     fn collection(
@@ -324,20 +359,24 @@ impl Validator<'_, '_> {
         for i in 0..if dict { 2 * count } else { count } {
             let addr = first + i * width;
             let by_pointer = self.doc.is_pointer(addr);
-            let target = if by_pointer {
-                self.pointer(addr, wide, false)?
-            } else if self.doc.size_of(addr).is_some_and(|size| size <= width) {
-                addr
-            } else {
-                return Err(DecodeError::Malformed { pos: addr });
+            // A value that is not pointed at has to fit the slot it lies in.
+            let (target, limit) = match by_pointer {
+                true => (self.pointer(addr, wide, false)?, usize::MAX),
+                false => (addr, width),
             };
             if dict && i % 2 == 0 {
-                let key = match self.doc.raw(target).map(|raw| raw.0) {
-                    Some(Raw::Int(PARENT_KEY)) if i == 0 => {
+                let Some((raw, _)) = self.doc.raw(target).filter(|(_, size)| *size <= limit) else {
+                    return Err(match by_pointer {
+                        true => DecodeError::BadKey { pos },
+                        false => DecodeError::Malformed { pos: addr },
+                    });
+                };
+                let key = match raw {
+                    Raw::Int(PARENT_KEY) if i == 0 => {
                         inherits = true;
                         Key::Int(PARENT_KEY)
                     }
-                    Some(Raw::Int(key)) => {
+                    Raw::Int(key) => {
                         let known = u16::try_from(key)
                             .ok()
                             .and_then(|key| self.doc.shared?.decode(key))
@@ -347,9 +386,8 @@ impl Validator<'_, '_> {
                         }
                         Key::Int(key)
                     }
-                    Some(Raw::Str(bytes)) => {
-                        std::str::from_utf8(bytes)
-                            .map_err(|_| DecodeError::InvalidUtf8 { pos: target })?;
+                    Raw::Str(bytes) => {
+                        self.utf8(target, bytes, by_pointer)?;
                         Key::Str(bytes)
                     }
                     _ => return Err(DecodeError::BadKey { pos }),
@@ -361,7 +399,7 @@ impl Validator<'_, '_> {
                 values += 1;
                 continue;
             }
-            let (inner, inner_height) = self.value(target, depth + 1, by_pointer)?;
+            let (inner, inner_height) = self.value(target, depth + 1, by_pointer, limit)?;
             // The entry a dictionary inherits through has to lead to a dictionary.
             if inherits
                 && i == 1

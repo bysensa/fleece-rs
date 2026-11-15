@@ -63,15 +63,24 @@ fn nested(depth: usize, leaf: i64) -> Value {
 
 fn main() {
     let value = Value::Array((0..1000).map(record).collect());
-    // `cargo bench -- --profile-encode`: nothing but encoding, for a profiler to sample.
-    if std::env::args().any(|arg| arg == "--profile-encode") {
+    let bytes = encode(&value).unwrap();
+    // `cargo bench -- --profile-encode` (or `-check`, `-decode`): nothing but that one
+    // operation for 8 seconds, for a profiler to sample.
+    let profiled =
+        std::env::args().find_map(|arg| arg.strip_prefix("--profile-").map(String::from));
+    if let Some(operation) = profiled {
+        let doc = Doc::new(&bytes).unwrap();
         let start = Instant::now();
         while start.elapsed().as_secs() < 8 {
-            black_box(encode(black_box(&value)).unwrap());
+            match operation.as_str() {
+                "encode" => drop(black_box(encode(black_box(&value)).unwrap())),
+                "check" => black_box(Doc::trusted(black_box(&bytes)).validate()).unwrap(),
+                "decode" => drop(black_box(Value::from_ref(black_box(doc).root()).unwrap())),
+                _ => panic!("--profile-encode, --profile-check or --profile-decode"),
+            }
         }
         return;
     }
-    let bytes = encode(&value).unwrap();
     let json = fleece::json::to_json(&value);
     let text = json.to_string();
     println!("1000 records: {} bytes of Fleece, {} bytes of JSON\n", bytes.len(), text.len());
@@ -85,6 +94,10 @@ fn main() {
     measure("serde_json: write one record", one_json.to_string().len(), || one_json.to_string());
     measure("fleece: check a document", bytes.len(), || Doc::new(&bytes).unwrap());
     measure("fleece: check and decode to a value", bytes.len(), || decode(&bytes).unwrap());
+    let checked = Doc::new(&bytes).unwrap();
+    measure("fleece: decode a checked document", bytes.len(), || {
+        Value::from_ref(checked.root()).unwrap()
+    });
     measure("fleece: read one field in place, unchecked", bytes.len(), || {
         path.eval(Doc::trusted(&bytes).root()).unwrap().as_str().unwrap().len()
     });
