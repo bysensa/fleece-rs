@@ -66,7 +66,7 @@ pub mod ext {
     pub const F16: u8 = 8;
     /// `decimal`, payload data of 16 bytes.
     pub const DECIMAL: u8 = 9;
-    /// `bigdecimal`, payload string.
+    /// `bigdecimal`, payload array `[scale, coefficient]`, the coefficient as data.
     pub const BIG_DECIMAL: u8 = 10;
     /// `duration`, payload data of 12 bytes.
     pub const DURATION: u8 = 11;

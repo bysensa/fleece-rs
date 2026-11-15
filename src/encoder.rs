@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use crate::error::EncodeError;
 use crate::format::*;
-use crate::reader::ValueRef;
+use crate::reader::{Item, ValueRef};
 use crate::shared_keys::SharedKeys;
 
 /// Strings of these lengths are written once and pointed at afterwards.
@@ -30,8 +30,38 @@ enum SortKey {
     InBase(Box<[u8]>),
 }
 
+/// The shared keys an encoder writes dictionary keys with.
+enum Shared<'k> {
+    None,
+    /// Keys that are not in the table yet are added to it.
+    Growing(&'k mut SharedKeys),
+    /// Only the keys the table holds are written as numbers.
+    Fixed(&'k SharedKeys),
+}
+
+impl Shared<'_> {
+    fn number(&mut self, key: &str) -> Option<u16> {
+        match self {
+            Self::None => None,
+            Self::Growing(shared) => shared.encode_and_add(key),
+            Self::Fixed(shared) => shared.encode(key),
+        }
+    }
+
+    fn key(&self, number: u16) -> Option<&str> {
+        match self {
+            Self::None => None,
+            Self::Growing(shared) => shared.decode(number),
+            Self::Fixed(shared) => shared.decode(number),
+        }
+    }
+}
+
 struct Frame {
     dict: bool,
+    /// The dictionary of the base document this one inherits from: only the entries that
+    /// differ are written.
+    parent: Option<usize>,
     /// The kind of the extended value this collection is the payload of.
     ext: Option<u8>,
     slots: Vec<Slot>,
@@ -65,7 +95,7 @@ pub struct Encoder<'k> {
     stack: Vec<Frame>,
     /// The positions of the short strings written so far.
     strings: HashMap<Box<[u8]>, usize>,
-    shared: Option<&'k mut SharedKeys>,
+    shared: Shared<'k>,
     root: Option<Slot>,
     pending_ext: Option<u8>,
     scratch: Vec<u8>,
@@ -85,7 +115,7 @@ impl<'k> Encoder<'k> {
             external: false,
             stack: Vec::new(),
             strings: HashMap::new(),
-            shared: None,
+            shared: Shared::None,
             root: None,
             pending_ext: None,
             scratch: Vec::new(),
@@ -110,7 +140,14 @@ impl<'k> Encoder<'k> {
     /// An encoder that writes eligible dictionary keys as numbers of `shared`, adding the
     /// keys it does not hold yet.
     pub fn with_shared_keys(mut self, shared: &'k mut SharedKeys) -> Self {
-        self.shared = Some(shared);
+        self.shared = Shared::Growing(shared);
+        self
+    }
+
+    /// An encoder that writes the keys `shared` holds as their numbers and adds none: for
+    /// writing anew what was written with the table, which then needs no change.
+    pub fn with_fixed_shared_keys(mut self, shared: &'k SharedKeys) -> Self {
+        self.shared = Shared::Fixed(shared);
         self
     }
 
@@ -263,8 +300,7 @@ impl<'k> Encoder<'k> {
         if !takes_key || self.pending_ext.is_some() {
             return Err(EncodeError::UnexpectedKey);
         }
-        let shared = self.shared.as_deref_mut().and_then(|shared| shared.encode_and_add(key));
-        let (slot, sort_key) = match shared {
+        let (slot, sort_key) = match self.shared.number(key) {
             Some(number) => {
                 let mut bytes = [0; 2];
                 bytes.copy_from_slice(&(number & 0x0FFF).to_be_bytes());
@@ -283,13 +319,14 @@ impl<'k> Encoder<'k> {
         Ok(())
     }
 
-    fn begin(&mut self, dict: bool) -> Result<(), EncodeError> {
+    fn begin(&mut self, dict: bool, parent: Option<usize>) -> Result<(), EncodeError> {
         self.check_value()?;
         if self.stack.len() >= MAX_DEPTH {
             return Err(EncodeError::TooDeep);
         }
         self.stack.push(Frame {
             dict,
+            parent,
             ext: self.pending_ext.take(),
             slots: Vec::new(),
             keys: Vec::new(),
@@ -299,11 +336,26 @@ impl<'k> Encoder<'k> {
     }
 
     pub fn begin_array(&mut self) -> Result<(), EncodeError> {
-        self.begin(false)
+        self.begin(false, None)
     }
 
     pub fn begin_dict(&mut self) -> Result<(), EncodeError> {
-        self.begin(true)
+        self.begin(true, None)
+    }
+
+    /// Begins a dictionary that inherits from the dictionary of the base document at
+    /// `parent`: it has every entry of that one, but for the entries written into it, an
+    /// entry whose value is `undefined` being a deletion.
+    pub(crate) fn begin_dict_over(&mut self, parent: usize) -> Result<(), EncodeError> {
+        if parent >= self.base_len {
+            return Err(EncodeError::NotInBase);
+        }
+        self.begin(true, Some(parent))
+    }
+
+    /// Fleece's `undefined`: the value of a key deleted from a dictionary that inherits.
+    pub(crate) fn write_undefined(&mut self) -> Result<(), EncodeError> {
+        self.scalar(|out| out.extend_from_slice(&[SPECIAL_UNDEFINED, 0]))
     }
 
     pub fn end_array(&mut self) -> Result<(), EncodeError> {
@@ -347,26 +399,27 @@ impl<'k> Encoder<'k> {
     }
 
     fn collection(&mut self, frame: Frame) -> Result<Slot, EncodeError> {
-        let Frame { dict, ext, mut slots, keys, .. } = frame;
-        let count = if dict { keys.len() } else { slots.len() };
+        let Frame { dict, parent, ext, mut slots, keys, .. } = frame;
+        let mut count = if dict { keys.len() } else { slots.len() };
         if dict {
             let mut order: Vec<usize> = (0..count).collect();
             order.sort_by(|&a, &b| self.compare_keys(&keys[a], &keys[b]));
             for pair in order.windows(2) {
                 if self.compare_keys(&keys[pair[0]], &keys[pair[1]]) == Ordering::Equal {
                     let key = match keys[pair[0]] {
-                        SortKey::Shared(number) => self
-                            .shared
-                            .as_deref()
-                            .and_then(|shared| shared.decode(number))
-                            .unwrap_or_default()
-                            .to_owned(),
+                        SortKey::Shared(number) => {
+                            self.shared.key(number).unwrap_or_default().to_owned()
+                        }
                         ref key => String::from_utf8_lossy(self.key_bytes(key)).into_owned(),
                     };
                     return Err(EncodeError::DuplicateKey(key));
                 }
             }
-            slots = order.iter().flat_map(|&i| [slots[2 * i], slots[2 * i + 1]]).collect();
+            // The entry of the parent has the lowest key there is, so it comes first.
+            let parent = parent.map(|parent| [Slot::Inline([0x08, 0x00]), Slot::Pointer(parent)]);
+            let entries = order.iter().map(|&i| [slots[2 * i], slots[2 * i + 1]]);
+            slots = parent.into_iter().chain(entries).flatten().collect();
+            count = slots.len() / 2;
         }
         let tag = if dict { TAG_DICT } else { TAG_ARRAY };
         if count == 0 && ext.is_none() {
@@ -449,6 +502,43 @@ impl<'k> Encoder<'k> {
         };
         self.push(slot);
         Ok(())
+    }
+
+    /// Writes a copy of a value of any document, with everything it leads to: strings that
+    /// repeat are written once, a dictionary that inherits is written whole, and the keys
+    /// are written with the shared keys of this encoder.
+    pub fn write_copy(&mut self, value: ValueRef<'_>) -> Result<(), EncodeError> {
+        match value.item() {
+            Item::String(text) => self.write_str(text),
+            Item::Array(array) => {
+                self.begin_array()?;
+                for item in array.iter() {
+                    self.write_copy(item)?;
+                }
+                self.end_array()
+            }
+            Item::Dict(dict) => {
+                self.begin_dict()?;
+                for (key, value) in dict.iter() {
+                    self.write_key(key)?;
+                    self.write_copy(value)?;
+                }
+                self.end_dict()
+            }
+            Item::Ext(kind, Some(payload)) => {
+                self.begin_ext(kind)?;
+                self.write_copy(payload)
+            }
+            Item::Invalid => Err(EncodeError::InvalidValue),
+            // Every other value is its own bytes, wherever they are.
+            _ => {
+                let position = value.position();
+                let size = value.doc().size_of(position).ok_or(EncodeError::InvalidValue)?;
+                let bytes = value.doc().tail(position).get(..size);
+                let bytes = bytes.ok_or(EncodeError::InvalidValue)?;
+                self.scalar(|out| out.extend_from_slice(bytes))
+            }
+        }
     }
 
     /// The document: everything written, ended by the root or a pointer to it.

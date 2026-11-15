@@ -141,7 +141,10 @@ impl Encoder<'_> {
             }
             Number::BigDecimal(v) => {
                 self.begin_ext(ext::BIG_DECIMAL)?;
-                return self.write_str(v.as_str());
+                self.begin_array()?;
+                self.write_uint(u64::from(v.scale()))?;
+                self.write_data(v.coefficient())?;
+                return self.end_array();
             }
             Number::U64(v) => {
                 self.begin_ext(ext::U64)?;
@@ -413,8 +416,10 @@ impl Payload {
                 number(Number::Decimal(decimal.ok_or(self.error.clone())?))
             }
             ext::BIG_DECIMAL => {
-                let text = payload.as_str().ok_or(self.error.clone())?;
-                number(Number::BigDecimal(text.parse().map_err(|_| self.error.clone())?))
+                let [scale, coefficient] = self.items(payload)?;
+                let coefficient = coefficient.as_data().ok_or(self.error.clone())?;
+                let decimal = BigDecimal::new(coefficient, self.sized(scale)?);
+                number(Number::BigDecimal(decimal.ok_or(self.error.clone())?))
             }
             ext::DURATION => {
                 let (secs, nanos) = self.seconds(payload)?;

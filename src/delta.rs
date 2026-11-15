@@ -1,8 +1,10 @@
 //! The difference between two values, in two forms.
 //!
 //! [`append_delta`] gives bytes to append to an encoded document: the new root, with every
-//! part that did not change written as a pointer into the old bytes. The result is read
-//! like any document, without applying anything.
+//! part that did not change written as a pointer into the old bytes, and a dictionary of
+//! which few entries changed written as those entries over the old one. The result is read
+//! like any document, without applying anything. A document that took many deltas holds
+//! what they replaced; see [`crate::compact`].
 //!
 //! [`diff`] gives the changes as a value, in the form Fleece documents in `Deltas.md` for its
 //! JSON deltas, and [`apply`] turns the old value into the new one with it. It suits sending a
@@ -10,8 +12,12 @@
 
 use crate::encoder::Encoder;
 use crate::error::{DeltaError, EncodeError};
-use crate::reader::{Doc, Item, ValueRef};
+use crate::reader::{DictRef, Doc, Item, ValueRef};
 use crate::value::{Number, Object, Value};
+
+/// Through how many dictionaries a dictionary written by a delta may inherit. A lookup of a
+/// key asks each of them in turn, so past this depth the dictionary is written whole.
+const MAX_INHERIT_DEPTH: usize = 4;
 
 /// The bytes that, appended to the document `base`, make a document whose root is `new`.
 pub fn append_delta(base: &[u8], new: &Value) -> Result<Vec<u8>, DeltaError> {
@@ -21,38 +27,80 @@ pub fn append_delta(base: &[u8], new: &Value) -> Result<Vec<u8>, DeltaError> {
     Ok(encoder.finish()?)
 }
 
+/// What to write for a new value, given the old one at the same place.
+enum Plan {
+    /// The old value, as a pointer to it.
+    Same,
+    /// The new value, whole.
+    Replace,
+    /// A collection of the same kind: a plan for each field or item of the new one, in its
+    /// order.
+    Children(Vec<Plan>),
+}
+
+/// Compares the two values once, from the leaves up.
+fn plan(old: &Value, new: &Value) -> Plan {
+    let children: Vec<Plan> = match (old, new) {
+        (Value::Object(old), Value::Object(new)) => {
+            let child = |(key, value): (&String, &Value)| {
+                old.get(key).map_or(Plan::Replace, |old| plan(old, value))
+            };
+            let children: Vec<Plan> = new.iter().map(child).collect();
+            if old.len() != new.len() {
+                return Plan::Children(children);
+            }
+            children
+        }
+        (Value::Array(old), Value::Array(new)) => {
+            let child = |(index, value): (usize, &Value)| {
+                old.get(index).map_or(Plan::Replace, |old| plan(old, value))
+            };
+            let children: Vec<Plan> = new.iter().enumerate().map(child).collect();
+            if old.len() != new.len() {
+                return Plan::Children(children);
+            }
+            children
+        }
+        _ => return if old == new { Plan::Same } else { Plan::Replace },
+    };
+    if children.iter().all(|child| matches!(child, Plan::Same)) {
+        Plan::Same
+    } else {
+        Plan::Children(children)
+    }
+}
+
 impl Encoder<'_> {
     /// Writes `new`, pointing at `old` and at the parts of it that are the same in `new`.
     /// `old` has to be a value of the document given to [`Encoder::with_base`].
     pub fn write_changed(&mut self, old: ValueRef<'_>, new: &Value) -> Result<(), EncodeError> {
         match Value::from_ref(old) {
-            Ok(old_value) => self.changed(old, &old_value, new),
+            Ok(old_value) => self.changed(old, &old_value, new, &plan(&old_value, new)),
             Err(_) => self.write_value(new),
         }
     }
 
-    fn changed(&mut self, at: ValueRef<'_>, old: &Value, new: &Value) -> Result<(), EncodeError> {
-        if old == new {
-            return self.write_ref(at);
-        }
+    fn changed(
+        &mut self,
+        at: ValueRef<'_>,
+        old: &Value,
+        new: &Value,
+        plan: &Plan,
+    ) -> Result<(), EncodeError> {
+        let children = match plan {
+            Plan::Same => return self.write_ref(at),
+            Plan::Replace => return self.write_value(new),
+            Plan::Children(children) => children,
+        };
         match (at.item(), old, new) {
             (Item::Dict(dict), Value::Object(old), Value::Object(new)) => {
-                self.begin_dict()?;
-                for (key, value) in new {
-                    // A key the old dictionary has is pointed at, not written again.
-                    self.write_key_at(key, dict.key_position(key))?;
-                    match (dict.get(key), old.get(key)) {
-                        (Some(at), Some(old)) => self.changed(at, old, value)?,
-                        _ => self.write_value(value)?,
-                    }
-                }
-                self.end_dict()
+                self.changed_dict(at.position(), dict, old, new, children)
             }
             (Item::Array(array), Value::Array(old), Value::Array(new)) => {
                 self.begin_array()?;
-                for (index, value) in new.iter().enumerate() {
+                for ((index, value), plan) in new.iter().enumerate().zip(children) {
                     match (array.get(index), old.get(index)) {
-                        (Some(at), Some(old)) => self.changed(at, old, value)?,
+                        (Some(at), Some(old)) => self.changed(at, old, value, plan)?,
                         _ => self.write_value(value)?,
                     }
                 }
@@ -60,6 +108,45 @@ impl Encoder<'_> {
             }
             _ => self.write_value(new),
         }
+    }
+
+    fn changed_dict(
+        &mut self,
+        position: usize,
+        dict: DictRef<'_>,
+        old: &Object,
+        new: &Object,
+        children: &[Plan],
+    ) -> Result<(), EncodeError> {
+        let deleted = || old.keys().filter(|key| !new.contains_key(*key));
+        let rewritten = children.iter().filter(|plan| !matches!(plan, Plan::Same)).count();
+        // A dictionary of which less than half changes is written as its changes over the
+        // old one, which costs an entry more and saves all that stay.
+        let inherit = 2 * (rewritten + deleted().count() + 1) < new.len()
+            && dict.inherit_depth() < MAX_INHERIT_DEPTH;
+        if inherit {
+            self.begin_dict_over(position)?;
+        } else {
+            self.begin_dict()?;
+        }
+        for ((key, value), plan) in new.iter().zip(children) {
+            if inherit && matches!(plan, Plan::Same) {
+                continue;
+            }
+            // A key the old dictionary has is pointed at, not written again.
+            self.write_key_at(key, dict.key_position(key))?;
+            match (dict.get(key), old.get(key)) {
+                (Some(at), Some(old)) => self.changed(at, old, value, plan)?,
+                _ => self.write_value(value)?,
+            }
+        }
+        if inherit {
+            for key in deleted() {
+                self.write_key_at(key, dict.key_position(key))?;
+                self.write_undefined()?;
+            }
+        }
+        self.end_dict()
     }
 }
 
@@ -84,9 +171,6 @@ fn replacement(value: &Value) -> Value {
 /// Arrays are compared item by item at the same index, so an insertion at the front of an
 /// array changes every item after it.
 pub fn diff(old: &Value, new: &Value) -> Option<Value> {
-    if old == new {
-        return None;
-    }
     let mut delta = Object::new();
     match (old, new) {
         (Value::Object(old), Value::Object(new)) => {
@@ -109,13 +193,13 @@ pub fn diff(old: &Value, new: &Value) -> Option<Value> {
                 delta.insert(format!("{common}-"), Value::Array(new[common..].to_vec()));
             }
         }
-        _ => return Some(replacement(new)),
+        _ => return (old != new).then(|| replacement(new)),
     }
-    Some(Value::Object(delta))
+    (!delta.is_empty()).then_some(Value::Object(delta))
 }
 
-/// The value `delta` turns `old` into. `delta` is what [`diff`] gave for `old`; the byte
-/// patches of strings that Fleece's own deltas may hold (`["4=1-1+d|31=", 0, 2]`) are
+/// The value `delta` turns `old` into. `delta` is what [`diff`] gave for `old`, or a delta
+/// of Fleece's own: the byte patches of strings those may hold (`["4=1-1+d|30=", 0, 2]`) are
 /// applied as well.
 pub fn apply(old: &Value, delta: &Value) -> Result<Value, DeltaError> {
     apply_to(Some(old), delta)?.ok_or(DeltaError::Mismatch)
@@ -219,8 +303,6 @@ mod tests {
 
     #[test]
     fn string_patches_of_fleece_apply() {
-        // The example of `Deltas.md`, whose last count there is one byte more than the
-        // string has left.
         let old = Value::from("The fog comes in on little cat feet");
         let patch = Value::Array(vec!["4=1-1+d|30=".into(), 0.into(), 2.into()]);
         assert_eq!(apply(&old, &patch), Ok("The dog comes in on little cat feet".into()));

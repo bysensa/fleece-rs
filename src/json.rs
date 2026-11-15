@@ -95,7 +95,7 @@ pub fn to_json(value: &Value) -> Json {
             Number::F32(v) => typed("f32", float_json(f64::from(*v))),
             Number::F16(v) => typed("f16", float_json(v.to_f64())),
             Number::Decimal(v) => typed("decimal", json!(v.to_string())),
-            Number::BigDecimal(v) => typed("bigdecimal", json!(v.as_str())),
+            Number::BigDecimal(v) => typed("bigdecimal", json!(v.to_string())),
             Number::I8(v) => typed("i8", json!(v)),
             Number::U8(v) => typed("u8", json!(v)),
             Number::I16(v) => typed("i16", json!(v)),

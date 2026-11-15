@@ -12,6 +12,8 @@
 //! - [`SharedKeys`]: dictionary keys stored as small numbers across many documents;
 //! - [`Value`] with [`encode`] and [`decode`]: an owned value of any type SurrealDB has;
 //! - [`delta`]: the difference between two values, as bytes to append or as a value;
+//! - [`compact`]: a document that grew by appended deltas written anew without what they
+//!   left behind;
 //! - [`KeyPath`]: `foo.bar[2].baz` into a document;
 //! - [`json`] (feature `json`): JSON to values and back;
 //! - [`dump`]: a listing of a document by address.
@@ -47,6 +49,7 @@
 #![forbid(unsafe_code)]
 
 mod codec;
+mod compact;
 pub mod delta;
 mod dump;
 mod encoder;
@@ -60,6 +63,7 @@ mod shared_keys;
 mod value;
 
 pub use codec::{decode, encode};
+pub use compact::compact;
 pub use dump::dump;
 pub use encoder::Encoder;
 pub use error::{DecodeError, DeltaError, EncodeError};

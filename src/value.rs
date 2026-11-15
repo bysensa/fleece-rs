@@ -210,29 +210,150 @@ impl FromStr for Decimal {
     }
 }
 
-/// A decimal number of any size, as the text it was written as: an optional `-`, digits, and
-/// optionally a point and more digits. The text keeps the scale (`1.50` is not `1.5`), which
-/// is what SurrealDB's `bigdecimal` does.
+/// A decimal number of any size: `coefficient * 10^-scale`, as SurrealDB's `bigdecimal`
+/// holds it. The scale is kept as written, so `1.50` and `1.5` are two values here.
+///
+/// The coefficient is a signed integer in two's complement, little-endian, in the fewest
+/// bytes that hold it: the bytes of `num_bigint::BigInt::to_signed_bytes_le`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct BigDecimal(String);
+pub struct BigDecimal {
+    coefficient: Vec<u8>,
+    scale: u32,
+}
 
 impl BigDecimal {
-    pub fn as_str(&self) -> &str {
-        &self.0
+    /// The greatest scale, which is the greatest SurrealDB gives a value.
+    pub const MAX_SCALE: u32 = 294_910;
+
+    /// The number of a coefficient in two's complement, little-endian, of any length, and a
+    /// scale. `None` when the scale is above [`BigDecimal::MAX_SCALE`].
+    pub fn new(coefficient: &[u8], scale: u32) -> Option<Self> {
+        if scale > Self::MAX_SCALE {
+            return None;
+        }
+        let mut bytes = coefficient.to_vec();
+        if bytes.is_empty() {
+            bytes.push(0);
+        }
+        // A last byte that only repeats the sign of the one before it says nothing.
+        while let [.., before, last] = bytes[..]
+            && ((last == 0x00 && before & 0x80 == 0) || (last == 0xFF && before & 0x80 != 0))
+        {
+            bytes.pop();
+        }
+        Some(Self { coefficient: bytes, scale })
     }
+
+    /// The coefficient in two's complement, little-endian, in the fewest bytes.
+    pub fn coefficient(&self) -> &[u8] {
+        &self.coefficient
+    }
+
+    /// The number of digits after the point.
+    pub fn scale(&self) -> u32 {
+        self.scale
+    }
+
+    pub fn is_negative(&self) -> bool {
+        self.coefficient.last().is_some_and(|byte| byte & 0x80 != 0)
+    }
+
+    /// The absolute value of the coefficient as 32-bit digits, the lowest first.
+    fn magnitude(&self) -> Vec<u32> {
+        let mut bytes = self.coefficient.clone();
+        if self.is_negative() {
+            negate(&mut bytes);
+        }
+        let limb = |chunk: &[u8]| {
+            let mut bytes = [0; 4];
+            bytes[..chunk.len()].copy_from_slice(chunk);
+            u32::from_le_bytes(bytes)
+        };
+        bytes.chunks(4).map(limb).collect()
+    }
+}
+
+/// Negates a little-endian integer in two's complement, in place.
+fn negate(bytes: &mut [u8]) {
+    let mut carry = true;
+    for byte in bytes {
+        (*byte, carry) = (!*byte).overflowing_add(u8::from(carry));
+    }
+}
+
+/// The decimal digits of a number of 32-bit digits, the lowest first.
+fn decimal_digits(mut limbs: Vec<u32>) -> String {
+    const GROUP: u64 = 1_000_000_000;
+    // Each division by 10^9 takes the 9 lowest decimal digits off the number.
+    let mut groups = Vec::new();
+    loop {
+        while limbs.last() == Some(&0) {
+            limbs.pop();
+        }
+        if limbs.is_empty() {
+            break;
+        }
+        let mut remainder = 0;
+        for limb in limbs.iter_mut().rev() {
+            let current = remainder << 32 | u64::from(*limb);
+            *limb = (current / GROUP) as u32;
+            remainder = current % GROUP;
+        }
+        groups.push(remainder);
+    }
+    let mut text = groups.pop().unwrap_or(0).to_string();
+    for group in groups.iter().rev() {
+        text.push_str(&format!("{group:09}"));
+    }
+    text
+}
+
+/// The number decimal digits stand for, as 32-bit digits, the lowest first.
+fn limbs_of(digits: &str) -> Vec<u32> {
+    let mut limbs: Vec<u32> = Vec::new();
+    for group in digits.as_bytes().chunks(9) {
+        let mut carry = group.iter().fold(0, |value, digit| value * 10 + u64::from(digit - b'0'));
+        let shift = 10u64.pow(group.len() as u32);
+        for limb in &mut limbs {
+            let current = u64::from(*limb) * shift + carry;
+            *limb = current as u32;
+            carry = current >> 32;
+        }
+        if carry != 0 {
+            limbs.push(carry as u32);
+        }
+    }
+    limbs
 }
 
 impl FromStr for BigDecimal {
     type Err = ParseError;
 
+    /// Reads an optional `-`, digits, and optionally a point and more digits, whose number
+    /// becomes the scale.
     fn from_str(text: &str) -> Result<Self, ParseError> {
-        decimal_parts(text).map(|_| Self(text.to_owned())).ok_or(ParseError)
+        let (negative, whole, fraction) = decimal_parts(text).ok_or(ParseError)?;
+        let scale = u32::try_from(fraction.len()).map_err(|_| ParseError)?;
+        let limbs = limbs_of(&format!("{whole}{fraction}"));
+        let mut bytes: Vec<u8> = limbs.iter().flat_map(|limb| limb.to_le_bytes()).collect();
+        // One more byte keeps the sign apart from the highest digit.
+        bytes.push(0);
+        if negative {
+            negate(&mut bytes);
+        }
+        Self::new(&bytes, scale).ok_or(ParseError)
     }
 }
 
 impl Display for BigDecimal {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        let scale = self.scale as usize;
+        let digits = decimal_digits(self.magnitude());
+        let digits = format!("{digits:0>width$}", width = scale + 1);
+        let (whole, fraction) = digits.split_at(digits.len() - scale);
+        let sign = if self.is_negative() { "-" } else { "" };
+        let point = if scale > 0 { "." } else { "" };
+        write!(f, "{sign}{whole}{point}{fraction}")
     }
 }
 
@@ -498,7 +619,39 @@ mod tests {
         for text in ["", "-", "1.", ".5", "1e3", "79228162514264337593543950336"] {
             assert!(text.parse::<Decimal>().is_err(), "{text}");
         }
-        assert!("-0.000000000000000000000000000000001".parse::<BigDecimal>().is_ok());
+    }
+
+    #[test]
+    fn big_decimal_text_and_bytes() {
+        for text in [
+            "0",
+            "0.00",
+            "-1.50",
+            "127",
+            "128",
+            "-128",
+            "-129",
+            "4294967296",
+            "123456789012345678901234567890.000001",
+            "-0.000000000000000000000000000000001",
+            "1000000000000000000",
+        ] {
+            assert_eq!(text.parse::<BigDecimal>().unwrap().to_string(), text);
+        }
+        let bytes = |text: &str| text.parse::<BigDecimal>().unwrap().coefficient().to_vec();
+        assert_eq!(bytes("0"), [0]);
+        assert_eq!(bytes("127"), [0x7F]);
+        assert_eq!(bytes("128"), [0x80, 0x00]);
+        assert_eq!(bytes("-128"), [0x80]);
+        assert_eq!(bytes("-129"), [0x7F, 0xFF]);
+        assert_eq!(bytes("-1.50"), [0x6A, 0xFF]);
+        assert_eq!(bytes("-0"), [0]);
+        // The scale is part of the value, and bytes that only repeat the sign are not.
+        assert_ne!("1.50".parse::<BigDecimal>(), "1.5".parse::<BigDecimal>());
+        assert_eq!(BigDecimal::new(&[0x7F, 0, 0], 2), BigDecimal::new(&[0x7F], 2));
+        assert_eq!(BigDecimal::new(&[], 0), "0".parse().ok());
+        assert_eq!(BigDecimal::new(&[1], BigDecimal::MAX_SCALE + 1), None);
+        assert!("1e3".parse::<BigDecimal>().is_err());
     }
 
     #[test]

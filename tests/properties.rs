@@ -210,6 +210,73 @@ proptest! {
     }
 }
 
+/// The fields a change sets, or deletes when there is no value.
+type Change = Vec<(String, Option<Value>)>;
+
+/// A record of many fields, and a few changes of it: fields set, added and deleted.
+fn record_and_changes() -> impl Strategy<Value = (fleece::Object, Vec<Change>)> {
+    let record = btree_map("[a-z]{1,3}", value(), 20..60);
+    let change = vec(("[a-z]{1,3}", proptest::option::weighted(0.7, value())), 1..4);
+    (record, vec(change, 1..12))
+}
+
+proptest! {
+    #[test]
+    fn a_document_that_took_many_deltas_reads_as_the_last_value_and_compacts(
+        (mut record, changes) in record_and_changes(),
+        shared_keys: bool,
+    ) {
+        fn encoder(shared: Option<&mut SharedKeys>) -> Encoder<'_> {
+            match shared {
+                Some(shared) => Encoder::new().with_shared_keys(shared),
+                None => Encoder::new(),
+            }
+        }
+        let mut shared = SharedKeys::new();
+        let mut encoder_of_base = encoder(shared_keys.then_some(&mut shared));
+        encoder_of_base.write_value(&Value::Object(record.clone())).unwrap();
+        let mut bytes = encoder_of_base.finish().unwrap();
+
+        for change in changes {
+            for (key, value) in change {
+                match value {
+                    Some(value) => record.insert(key, value),
+                    None => record.remove(&key),
+                };
+            }
+            let new = Value::Object(record.clone());
+            let table = shared.clone();
+            let old = Doc::trusted(&bytes).with_shared_keys(&table).root();
+            let mut delta =
+                encoder(shared_keys.then_some(&mut shared)).with_base(&bytes, false).unwrap();
+            delta.write_changed(old, &new).unwrap();
+            bytes.extend(delta.finish().unwrap());
+
+            let doc = Doc::trusted(&bytes).with_shared_keys(&shared);
+            prop_assert_eq!(doc.validate(), Ok(()));
+            prop_assert_eq!(Value::from_ref(doc.root()).unwrap(), new);
+            // Every field is found by its key, through the dictionaries it inherits from.
+            let dict = doc.root().as_dict().unwrap();
+            prop_assert_eq!(dict.len(), record.len());
+            for (key, value) in &record {
+                let found = dict.get(key).map(Value::from_ref);
+                prop_assert_eq!(found, Some(Ok(value.clone())));
+            }
+        }
+
+        let doc = Doc::trusted(&bytes).with_shared_keys(&shared);
+        let live = doc.live_bytes();
+        prop_assert!(live <= bytes.len());
+        let compacted = fleece::compact(&doc).unwrap();
+        let fresh = Doc::trusted(&compacted).with_shared_keys(&shared);
+        prop_assert_eq!(fresh.validate(), Ok(()));
+        prop_assert_eq!(Value::from_ref(fresh.root()).unwrap(), Value::Object(record));
+        // Nothing is left in a compacted document but what its root leads to.
+        prop_assert_eq!(fresh.live_bytes(), compacted.len());
+        prop_assert!(compacted.len() <= bytes.len());
+    }
+}
+
 #[cfg(feature = "json")]
 proptest! {
     #[test]
@@ -236,9 +303,23 @@ fn a_small_change_makes_a_small_delta() {
     inner.insert("field007".to_owned(), Value::from("changed"));
     let new = Value::Object(fields);
     let delta = append_delta(&base, &new).unwrap();
-    // The two dictionaries on the way to the change are written again, nothing else.
-    assert!(delta.len() < base.len() / 4, "{} of {}", delta.len(), base.len());
-    assert_eq!(decode(&[base, delta].concat()).unwrap(), new);
+    // Each of the two dictionaries on the way to the change is written as the one entry
+    // that differs over the old dictionary: the changed string, 2 dictionaries of 2 entries
+    // and the pointer to the root.
+    assert_eq!(delta.len(), 8 + 10 + 10 + 2, "of {}", base.len());
+    let appended = [base, delta].concat();
+    assert_eq!(decode(&appended).unwrap(), new);
+    let doc = Doc::new(&appended).unwrap();
+    let inner = doc.root().as_dict().unwrap().get("inner").unwrap().as_dict().unwrap();
+    assert_eq!(inner.len(), 200);
+    assert_eq!(inner.get("field007").unwrap().as_str(), Some("changed"));
+    assert_eq!(inner.get("field008").unwrap().as_str(), Some("the value of 8"));
+
+    // What the delta replaced is still in the bytes, and compaction takes it out.
+    assert!(doc.live_bytes() < appended.len());
+    let compacted = fleece::compact(&doc).unwrap();
+    assert_eq!(decode(&compacted).unwrap(), new);
+    assert_eq!(compacted.len(), encode(&new).unwrap().len());
 
     let change = diff(&old, &new).unwrap();
     let inner = fleece::Object::from([("field007".to_owned(), Value::from("changed"))]);

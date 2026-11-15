@@ -87,6 +87,8 @@ pub enum EncodeError {
     NotInBase,
     /// The base document has an odd length.
     BadBase,
+    /// The value given to `write_copy` is not a well formed value.
+    InvalidValue,
 }
 
 impl Display for EncodeError {
@@ -104,6 +106,7 @@ impl Display for EncodeError {
             Self::TooLarge => f.write_str("a value lies farther back than a pointer reaches"),
             Self::NotInBase => f.write_str("the value is not in the base document"),
             Self::BadBase => f.write_str("the base document has an odd length"),
+            Self::InvalidValue => f.write_str("the value to copy is not well formed"),
         }
     }
 }

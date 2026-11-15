@@ -82,6 +82,11 @@ impl<'a> Doc<'a> {
         ValueRef { doc: *self, pos }
     }
 
+    /// The shared keys the document was given.
+    pub(crate) fn shared(&self) -> Option<&'a SharedKeys> {
+        self.shared
+    }
+
     /// The length of base and document together.
     pub(crate) fn end(&self) -> usize {
         self.base.len() + self.data.len()
@@ -606,6 +611,11 @@ impl<'a> DictRef<'a> {
         self.value_at(self.find_entry(key)?)
     }
 
+    /// How many dictionaries this one inherits through.
+    pub(crate) fn inherit_depth(&self) -> usize {
+        std::iter::successors(self.parent(), DictRef::parent).count()
+    }
+
     /// Where this dictionary keeps the string of `key`, when it holds the key as a string.
     pub(crate) fn key_position(&self, key: &str) -> Option<usize> {
         self.slot(2 * self.find_entry(Key::Str(key.as_bytes()))?)
@@ -613,14 +623,16 @@ impl<'a> DictRef<'a> {
 
     /// The value of `key`, in logarithmic time.
     pub fn get(&self, key: &str) -> Option<ValueRef<'a>> {
-        // A key the shared keys hold is always stored as its number.
-        let key = match self.doc.shared.and_then(|shared| shared.encode(key)) {
-            Some(shared) => Key::Int(i64::from(shared)),
-            None => Key::Str(key.as_bytes()),
-        };
+        // A key the shared keys hold is stored as its number. A dictionary written before the
+        // key came into the table has it as a string, so each dictionary on the way is
+        // asked for both, the nearest one that has either deciding.
+        let shared = self.doc.shared.and_then(|shared| shared.encode(key));
+        let number = shared.map(|number| Key::Int(i64::from(number)));
+        let text = Key::Str(key.as_bytes());
         let mut dict = *self;
         loop {
-            if let Some(value) = dict.find(key) {
+            let found = number.and_then(|number| dict.find(number)).or_else(|| dict.find(text));
+            if let Some(value) = found {
                 let deleted = dict.inherits() && matches!(value.item(), Item::Undefined);
                 return (!deleted).then_some(value);
             }
